@@ -3,6 +3,8 @@ import requests
 import telebot
 from flask import Flask
 from threading import Thread
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 TOKEN = os.environ["BOT_TOKEN"]
 ODDS_API_KEY = os.environ["ODDS_API_KEY"]
@@ -46,21 +48,47 @@ def odds(message):
         jogos = resposta.json()
 
         if not jogos:
-            bot.reply_to(message, "Não encontrei jogos disponíveis no momento.")
+            bot.reply_to(
+                message,
+                "⚽ Não encontrei jogos disponíveis no momento."
+            )
             return
 
         texto = "⚽ ODDS DE FUTEBOL\n\n"
 
         for jogo in jogos[:10]:
+
             home = jogo.get("home_team", "")
             away = jogo.get("away_team", "")
 
+            # Data e horário da partida
+            commence_time = jogo.get("commence_time")
+
+            if commence_time:
+                data_utc = datetime.fromisoformat(
+                    commence_time.replace("Z", "+00:00")
+                )
+
+                horario_brasilia = data_utc.astimezone(
+                    ZoneInfo("America/Sao_Paulo")
+                )
+
+                data_hora = horario_brasilia.strftime(
+                    "%d/%m/%Y às %H:%M"
+                )
+            else:
+                data_hora = "Horário indisponível"
+
             texto += f"🏟️ {home} x {away}\n"
+            texto += f"📅 {data_hora} (Brasília)\n"
 
             bookmakers = jogo.get("bookmakers", [])
 
             if bookmakers:
                 bookmaker = bookmakers[0]
+
+                texto += f"🏦 {bookmaker.get('title', '')}\n"
+
                 mercados = bookmaker.get("markets", [])
 
                 if mercados:
@@ -69,6 +97,7 @@ def odds(message):
                     for outcome in outcomes:
                         nome = outcome.get("name", "")
                         odd = outcome.get("price", "")
+
                         texto += f"• {nome}: {odd}\n"
 
             texto += "\n"
@@ -85,7 +114,8 @@ def odds(message):
 def responder(message):
     bot.reply_to(
         message,
-        "Comando não reconhecido. Use /odds para consultar as odds."
+        "Comando não reconhecido.\n\n"
+        "Use /odds para consultar as odds."
     )
 
 Thread(target=run).start()
