@@ -1,13 +1,10 @@
 import os
-import time
 import requests
 import telebot
-
 from flask import Flask
 from threading import Thread
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-
 
 # =========================
 # CONFIGURAÇÕES
@@ -17,36 +14,37 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 
 EV_MINIMO = 3.0
-EV_MAXIMO = 25.0
-
-MINIMO_CASAS = 3
-
+BANCA = 1000.00
 KELLY_FRACAO = 0.25
-BANCA = 100.00
 
-TZ = ZoneInfo("America/Sao_Paulo")
-
-CHAT_ID = None
-ULTIMO_ENVIO = None
-
-
-# =========================
-# BOT
-# =========================
+FUSO = ZoneInfo("America/Sao_Paulo")
 
 bot = telebot.TeleBot(BOT_TOKEN)
-
-
-# =========================
-# FLASK / RENDER
-# =========================
-
 app = Flask(__name__)
 
+# Futebol
+ESPORTES = {
+    "Premier League": "soccer_epl",
+    "La Liga": "soccer_spain_la_liga",
+    "Serie A": "soccer_italy_serie_a",
+    "Bundesliga": "soccer_germany_bundesliga",
+    "Ligue 1": "soccer_france_ligue_one",
+    "Brasileirão": "soccer_brazil_campeonato",
+    "Champions League": "soccer_uefa_champs_league",
+    "Europa League": "soccer_uefa_europa_league",
+    "Conference League": "soccer_uefa_europa_conference_league",
+    "Libertadores": "soccer_conmebol_libertadores",
+    "Sul-Americana": "soccer_conmebol_sudamericana",
+}
+
+
+# =========================
+# FLASK
+# =========================
 
 @app.route("/")
 def home():
-    return "Bot funcionando!"
+    return "Bot de apostas online."
 
 
 def iniciar_servidor():
@@ -55,355 +53,269 @@ def iniciar_servidor():
 
 
 # =========================
-# CAMPEONATOS
-# =========================
-
-CAMPEONATOS = {
-    "soccer_epl": "Premier League",
-    "soccer_spain_la_liga": "La Liga",
-    "soccer_italy_serie_a": "Serie A",
-    "soccer_germany_bundesliga": "Bundesliga",
-    "soccer_france_ligue_one": "Ligue 1",
-    "soccer_brazil_campeonato": "Brasileirão",
-    "soccer_uefa_champs_league": "Champions League",
-    "soccer_uefa_europa_league": "Europa League",
-    "soccer_uefa_europa_conference_league": "Conference League",
-    "soccer_conmebol_libertadores": "Libertadores",
-    "soccer_conmebol_sudamericana": "Sul-Americana",
-}
-
-
-MERCADOS = [
-    "h2h",
-    "totals",
-    "btts"
-]
-
-
-# =========================
 # BUSCAR ODDS
 # =========================
 
-def buscar_odds(esporte):
+def buscar_odds(nome_liga, esporte):
 
     url = f"https://api.the-odds-api.com/v4/sports/{esporte}/odds"
 
     params = {
         "apiKey": ODDS_API_KEY,
         "regions": "eu",
-        "markets": ",".join(MERCADOS),
+        "markets": "h2h,totals,btts",
         "oddsFormat": "decimal"
     }
 
-    resposta = requests.get(url, params=params, timeout=30)
+    try:
 
-    if resposta.status_code == 401:
-        print("Erro 401: chave da Odds API inválida.")
+        resposta = requests.get(url, params=params, timeout=20)
+
+        print(f"[API] {nome_liga} -> HTTP {resposta.status_code}")
+
+        if resposta.status_code != 200:
+            print(f"[API] Erro: {resposta.text[:500]}")
+            return []
+
+        dados = resposta.json()
+
+        print(f"[API] {nome_liga} -> {len(dados)} jogos encontrados")
+
+        return dados
+
+    except Exception as erro:
+
+        print(f"[API] Erro em {nome_liga}: {erro}")
+
         return []
 
-    if resposta.status_code == 422:
-        print("Erro 422: mercado ou campeonato não disponível.")
-        return []
 
-    if resposta.status_code != 200:
-        print("Erro Odds API:", resposta.status_code)
-        return []
+# =========================
+# PROBABILIDADE
+# =========================
 
-    return resposta.json()
+def calcular_probabilidade(odd):
+
+    if odd <= 1:
+        return 0
+
+    return 1 / odd
 
 
 # =========================
-# PROBABILIDADES
-# =========================
-
-def calcular_probabilidades(bookmakers):
-
-    probabilidades = {}
-
-    for bookmaker in bookmakers:
-
-        for mercado in bookmaker.get("markets", []):
-
-            outcomes = mercado.get("outcomes", [])
-
-            if not outcomes:
-                continue
-
-            # Soma das probabilidades implícitas
-            soma = 0
-
-            for outcome in outcomes:
-
-                odd = outcome.get("price")
-
-                if odd and odd > 1:
-                    soma += 1 / odd
-
-            if soma <= 0:
-                continue
-
-            # Remove aproximadamente a margem da casa
-            for outcome in outcomes:
-
-                nome = outcome.get("name")
-                odd = outcome.get("price")
-
-                if not nome or not odd or odd <= 1:
-                    continue
-
-                prob = (1 / odd) / soma
-
-                if nome not in probabilidades:
-                    probabilidades[nome] = []
-
-                probabilidades[nome].append(prob)
-
-    return probabilidades
-
-
-# =========================
-# ANÁLISE DE UM JOGO
-# =========================
-
-def analisar_jogo(evento):
-
-    bookmakers = evento.get("bookmakers", [])
-
-    if len(bookmakers) < MINIMO_CASAS:
-        return []
-
-    resultados = []
-
-    # Organizar todos os mercados
-    mercados = {}
-
-    for bookmaker in bookmakers:
-
-        for mercado in bookmaker.get("markets", []):
-
-            key = mercado.get("key")
-
-            if key not in mercados:
-                mercados[key] = []
-
-            mercados[key].append(bookmaker)
-
-    for mercado_key, casas in mercados.items():
-
-        if len(casas) < MINIMO_CASAS:
-            continue
-
-        probabilidades = calcular_probabilidades(casas)
-
-        if not probabilidades:
-            continue
-
-        # Encontrar melhor odd para cada resultado
-        melhores = {}
-
-        for bookmaker in casas:
-
-            nome_casa = bookmaker.get("title", "Casa")
-
-            for mercado in bookmaker.get("markets", []):
-
-                if mercado.get("key") != mercado_key:
-                    continue
-
-                for outcome in mercado.get("outcomes", []):
-
-                    nome = outcome.get("name")
-                    odd = outcome.get("price")
-
-                    if not nome or not odd:
-                        continue
-
-                    if nome not in melhores or odd > melhores[nome]["odd"]:
-                        melhores[nome] = {
-                            "odd": odd,
-                            "casa": nome_casa
-                        }
-
-        for resultado, probs in probabilidades.items():
-
-            # Precisamos de pelo menos 4 casas para formar consenso
-            if len(probs) < MINIMO_CASAS:
-                continue
-
-            # Média das probabilidades sem extremos
-            probs_ordenadas = sorted(probs)
-
-            if len(probs_ordenadas) >= 5:
-                probs_filtradas = probs_ordenadas[1:-1]
-            else:
-                probs_filtradas = probs_ordenadas
-
-            probabilidade = sum(probs_filtradas) / len(probs_filtradas)
-
-            if resultado not in melhores:
-                continue
-
-            odd = melhores[resultado]["odd"]
-            casa = melhores[resultado]["casa"]
-
-            # Evitar odds extremamente altas
-            if odd > 10:
-                continue
-
-            odd_justa = 1 / probabilidade
-
-            ev = ((probabilidade * odd) - 1) * 100
-
-            # Filtros
-            if ev < EV_MINIMO:
-                continue
-
-            if ev > EV_MAXIMO:
-                continue
-
-            # A melhor odd precisa estar realmente acima da odd justa
-            if odd <= odd_justa:
-                continue
-
-            # Kelly
-            b = odd - 1
-            q = 1 - probabilidade
-
-            kelly = ((b * probabilidade) - q) / b
-
-            if kelly <= 0:
-                continue
-
-            stake = BANCA * kelly * KELLY_FRACAO
-
-            # Limite de segurança
-            if stake > BANCA * 0.05:
-                stake = BANCA * 0.05
-
-            resultados.append({
-                "mercado": mercado_key,
-                "resultado": resultado,
-                "odd": odd,
-                "casa": casa,
-                "probabilidade": probabilidade,
-                "odd_justa": odd_justa,
-                "ev": ev,
-                "stake": stake,
-                "casas": len(probs)
-            })
-
-    return resultados
-
-
-# =========================
-# FORMATAR MERCADO
-# =========================
-
-def nome_mercado(mercado):
-
-    if mercado == "h2h":
-        return "Vencedor da partida (1X2)"
-
-    if mercado == "totals":
-        return "Mais/Menos gols"
-
-    if mercado == "btts":
-        return "Ambas marcam"
-
-    return mercado
-
-
-# =========================
-# ANALISAR TODOS OS JOGOS
+# ANÁLISE
 # =========================
 
 def analisar():
 
-    agora = datetime.now(TZ)
+    agora = datetime.now(FUSO)
+
     amanha = agora.date() + timedelta(days=1)
+
+    print("")
+    print("====================================")
+    print("INICIANDO ANÁLISE")
+    print(f"Data dos jogos: {amanha}")
+    print("====================================")
 
     oportunidades = []
 
-    for esporte, liga in CAMPEONATOS.items():
+    for nome_liga, esporte in ESPORTES.items():
 
-        try:
+        eventos = buscar_odds(nome_liga, esporte)
 
-            eventos = buscar_odds(esporte)
+        for evento in eventos:
 
-            for evento in eventos:
+            try:
 
-                data_evento = evento.get("commence_time")
+                horario = datetime.fromisoformat(
+                    evento["commence_time"].replace("Z", "+00:00")
+                )
 
-                if not data_evento:
-                    continue
-
-                try:
-                    data = datetime.fromisoformat(
-                        data_evento.replace("Z", "+00:00")
-                    ).astimezone(TZ)
-                except:
-                    continue
+                horario = horario.astimezone(FUSO)
 
                 # Somente jogos de amanhã
-                if data.date() != amanha:
+                if horario.date() != amanha:
                     continue
 
-                analises = analisar_jogo(evento)
+                times = f'{evento["home_team"]} x {evento["away_team"]}'
 
-                for analise in analises:
+                bookmakers = evento.get("bookmakers", [])
 
-                    analise["liga"] = liga
-                    analise["home"] = evento.get("home_team")
-                    analise["away"] = evento.get("away_team")
-                    analise["data"] = data
+                if not bookmakers:
+                    continue
 
-                    oportunidades.append(analise)
+                # =========================
+                # H2H
+                # =========================
 
-        except Exception as e:
+                mercado_h2h = {}
 
-            print(f"Erro em {liga}: {e}")
+                for bookmaker in bookmakers:
 
-    # Ordenar pelo EV
+                    for market in bookmaker.get("markets", []):
+
+                        if market["key"] != "h2h":
+                            continue
+
+                        for outcome in market.get("outcomes", []):
+
+                            nome = outcome["name"]
+                            odd = outcome.get("price")
+
+                            if not odd:
+                                continue
+
+                            mercado_h2h.setdefault(nome, []).append({
+                                "odd": odd,
+                                "casa": bookmaker["title"]
+                            })
+
+                # =========================
+                # TOTALS
+                # =========================
+
+                mercado_totals = {}
+
+                for bookmaker in bookmakers:
+
+                    for market in bookmaker.get("markets", []):
+
+                        if market["key"] != "totals":
+                            continue
+
+                        for outcome in market.get("outcomes", []):
+
+                            nome = outcome["name"]
+                            ponto = outcome.get("point")
+                            odd = outcome.get("price")
+
+                            if not odd or ponto is None:
+                                continue
+
+                            chave = f"{nome} {ponto}"
+
+                            mercado_totals.setdefault(chave, []).append({
+                                "odd": odd,
+                                "casa": bookmaker["title"]
+                            })
+
+                # =========================
+                # BTTS
+                # =========================
+
+                mercado_btts = {}
+
+                for bookmaker in bookmakers:
+
+                    for market in bookmaker.get("markets", []):
+
+                        if market["key"] != "btts":
+                            continue
+
+                        for outcome in market.get("outcomes", []):
+
+                            nome = outcome["name"]
+                            odd = outcome.get("price")
+
+                            if not odd:
+                                continue
+
+                            mercado_btts.setdefault(nome, []).append({
+                                "odd": odd,
+                                "casa": bookmaker["title"]
+                            })
+
+                mercados = [
+                    ("Resultado", mercado_h2h),
+                    ("Total de gols", mercado_totals),
+                    ("Ambas marcam", mercado_btts)
+                ]
+
+                for nome_mercado, mercado in mercados:
+
+                    for selecao, odds in mercado.items():
+
+                        if len(odds) < 2:
+                            continue
+
+                        # Usa a mediana das probabilidades
+                        probabilidades = [
+                            calcular_probabilidade(x["odd"])
+                            for x in odds
+                        ]
+
+                        probabilidades.sort()
+
+                        meio = len(probabilidades) // 2
+
+                        if len(probabilidades) % 2:
+                            prob = probabilidades[meio]
+                        else:
+                            prob = (
+                                probabilidades[meio - 1]
+                                + probabilidades[meio]
+                            ) / 2
+
+                        odd_melhor = max(odds, key=lambda x: x["odd"])
+
+                        odd = odd_melhor["odd"]
+
+                        prob = min(prob, 0.99)
+
+                        odd_justa = 1 / prob
+
+                        ev = ((prob * odd) - 1) * 100
+
+                        # Kelly fracionado
+                        b = odd - 1
+                        q = 1 - prob
+
+                        kelly = ((b * prob) - q) / b
+
+                        stake = max(
+                            0,
+                            BANCA * kelly * KELLY_FRACAO
+                        )
+
+                        if ev < EV_MINIMO:
+                            continue
+
+                        oportunidades.append({
+                            "liga": nome_liga,
+                            "jogo": times,
+                            "horario": horario,
+                            "mercado": nome_mercado,
+                            "selecao": selecao,
+                            "casa": odd_melhor["casa"],
+                            "odd": odd,
+                            "prob": prob * 100,
+                            "odd_justa": odd_justa,
+                            "ev": ev,
+                            "stake": stake
+                        })
+
+            except Exception as erro:
+
+                print(f"[ANÁLISE] Erro no jogo: {erro}")
+
     oportunidades.sort(
         key=lambda x: x["ev"],
         reverse=True
     )
 
-    # Evitar excesso de oportunidades do mesmo jogo
-    finais = []
-    jogos = set()
+    print("")
+    print(f"OPORTUNIDADES ENCONTRADAS: {len(oportunidades)}")
+    print("")
 
-    for op in oportunidades:
-
-        chave = (
-            op["home"],
-            op["away"],
-            op["mercado"]
-        )
-
-        if chave in jogos:
-            continue
-
-        jogos.add(chave)
-        finais.append(op)
-
-        if len(finais) >= 15:
-            break
-
-    return finais
+    return oportunidades
 
 
 # =========================
 # ENVIAR ANÁLISE
 # =========================
 
-def enviar_analise():
-
-    global CHAT_ID
-
-    if CHAT_ID is None:
-        print("CHAT_ID ainda não definido.")
-        return
+def enviar_analise(chat_id):
 
     try:
 
@@ -412,59 +324,44 @@ def enviar_analise():
         if not oportunidades:
 
             bot.send_message(
-                CHAT_ID,
+                chat_id,
                 "🔎 Nenhuma oportunidade EV+ encontrada para amanhã dentro dos filtros definidos."
             )
 
             return
 
         bot.send_message(
-            CHAT_ID,
-            f"📊 Foram encontradas {len(oportunidades)} oportunidades EV+."
+            chat_id,
+            f"✅ Encontrei {len(oportunidades)} oportunidade(s) EV+ para amanhã."
         )
 
-        for op in oportunidades:
-
-            data = op["data"]
+        for op in oportunidades[:20]:
 
             mensagem = (
-                "🔥 *OPORTUNIDADE EV+*\n\n"
+                f"⚽ {op['jogo']}\n"
+                f"🏆 {op['liga']}\n"
+                f"🕐 {op['horario'].strftime('%d/%m %H:%M')}\n\n"
 
-                f"🏆 *LIGA:* {op['liga']}\n"
-                f"⚽ *JOGO:* {op['home']} x {op['away']}\n"
-                f"📅 *DATA/HORA:* {data.strftime('%d/%m/%Y às %H:%M')} (Brasília)\n\n"
+                f"📊 Mercado: {op['mercado']}\n"
+                f"🎯 Seleção: {op['selecao']}\n"
+                f"🏦 Casa: {op['casa']}\n"
+                f"💰 Odd: {op['odd']:.2f}\n\n"
 
-                f"🎯 *MERCADO:* {nome_mercado(op['mercado'])}\n"
-                f"🏦 *APOSTAR EM:* {op['resultado']}\n"
-                f"💼 *MELHOR CASA:* {op['casa']}\n"
-                f"💰 *MELHOR ODD:* {op['odd']:.2f}\n\n"
-
-                f"📊 *PROBABILIDADE ESTIMADA:* {op['probabilidade'] * 100:.1f}%\n"
-                f"📐 *ODD JUSTA:* {op['odd_justa']:.2f}\n"
-                f"📈 *EV ESTIMADO:* +{op['ev']:.2f}%\n"
-                f"💵 *STAKE SUGERIDA:* R$ {op['stake']:.2f}\n\n"
-
-                f"🏦 *CASAS ANALISADAS:* {op['casas']}\n\n"
-
-                "📌 Stake baseada em Kelly fracionado (25%).\n"
-                "⚠️ EV é uma estimativa baseada nas odds disponíveis e não garante lucro."
+                f"📈 Probabilidade estimada: {op['prob']:.1f}%\n"
+                f"📐 Odd justa: {op['odd_justa']:.2f}\n"
+                f"💎 EV: +{op['ev']:.2f}%\n"
+                f"💵 Stake Kelly 25%: R$ {op['stake']:.2f}"
             )
 
-            bot.send_message(
-                CHAT_ID,
-                mensagem,
-                parse_mode="Markdown"
-            )
+            bot.send_message(chat_id, mensagem)
 
-            time.sleep(0.5)
+    except Exception as erro:
 
-    except Exception as e:
-
-        print("Erro na análise:", e)
+        print(f"[ENVIO] Erro: {erro}")
 
         bot.send_message(
-            CHAT_ID,
-            f"❌ Erro durante a análise: {e}"
+            chat_id,
+            "❌ Ocorreu um erro durante a análise. Veja os logs do Render."
         )
 
 
@@ -475,75 +372,35 @@ def enviar_analise():
 @bot.message_handler(commands=["start"])
 def start(message):
 
-    global CHAT_ID
-
-    CHAT_ID = message.chat.id
-
     bot.send_message(
-        CHAT_ID,
-        "🤖 Bot conectado!\n\n"
-        "Use /odds para analisar as oportunidades de amanhã."
+        message.chat.id,
+        "🤖 Bot de análise de apostas conectado!\n\n"
+        "Use /odds para analisar as oportunidades EV+ dos jogos de amanhã."
     )
 
 
 @bot.message_handler(commands=["odds"])
 def odds(message):
 
-    global CHAT_ID
-
-    CHAT_ID = message.chat.id
-
     bot.send_message(
-        CHAT_ID,
+        message.chat.id,
         "🔎 Analisando as odds disponíveis...\n"
         "Isso pode levar alguns segundos."
     )
 
     Thread(
-        target=enviar_analise
+        target=enviar_analise,
+        args=(message.chat.id,)
     ).start()
 
 
 @bot.message_handler(func=lambda message: True)
-def qualquer_mensagem(message):
+def outras_mensagens(message):
 
     bot.send_message(
         message.chat.id,
-        "Use /odds para executar uma análise ou /start para iniciar o bot."
+        "Use /odds para analisar as oportunidades ou /start para iniciar."
     )
-
-
-# =========================
-# ENVIO AUTOMÁTICO 09:00
-# =========================
-
-def agendador():
-
-    global ULTIMO_ENVIO
-
-    while True:
-
-        try:
-
-            agora = datetime.now(TZ)
-
-            if agora.hour == 9 and agora.minute == 0:
-
-                data_atual = agora.date()
-
-                if ULTIMO_ENVIO != data_atual:
-
-                    enviar_analise()
-
-                    ULTIMO_ENVIO = data_atual
-
-            time.sleep(30)
-
-        except Exception as e:
-
-            print("Erro no agendador:", e)
-
-            time.sleep(30)
 
 
 # =========================
@@ -557,13 +414,12 @@ if __name__ == "__main__":
         daemon=True
     ).start()
 
-    Thread(
-        target=agendador,
-        daemon=True
-    ).start()
-
-    print("🤖 Bot iniciado!")
+    print("================================")
+    print("BOT INICIADO")
+    print("================================")
 
     bot.infinity_polling(
-        skip_pending=True
+        skip_pending=True,
+        timeout=30,
+        long_polling_timeout=30
     )
