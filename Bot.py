@@ -17,12 +17,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 
 EV_MINIMO = 3.0
-EV_MAXIMO = 15.0
+EV_MAXIMO = 25.0
 
-MINIMO_CASAS = 4
+MINIMO_CASAS = 3
 
 KELLY_FRACAO = 0.25
-BANCA = 1000.00
+BANCA = 100.00
 
 TZ = ZoneInfo("America/Sao_Paulo")
 
