@@ -1,12 +1,12 @@
 import os
 import time
-import threading
-from datetime import datetime
-from zoneinfo import ZoneInfo
-
 import requests
 import telebot
+
 from flask import Flask
+from threading import Thread
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 
 # =========================================================
@@ -16,22 +16,16 @@ from flask import Flask
 TOKEN = os.environ["BOT_TOKEN"]
 ODDS_API_KEY = os.environ["ODDS_API_KEY"]
 
-# ID do chat que receberá os alertas.
-# Será preenchido automaticamente quando você usar /start.
+EV_MINIMO = 3.0
+INTERVALO_ANALISE = 600
+
 CHAT_ID = None
 
-# EV mínimo para enviar oportunidade
-EV_MINIMO = 3.0
-
-# Intervalo entre análises automáticas
-INTERVALO_ANALISE = 600  # 10 minutos
-
-# Evita mandar a mesma oportunidade repetidamente
 oportunidades_enviadas = set()
 
 
 # =========================================================
-# TELEGRAM / FLASK
+# BOT E SERVIDOR
 # =========================================================
 
 bot = telebot.TeleBot(TOKEN)
@@ -43,7 +37,7 @@ def home():
     return "Bot funcionando!"
 
 
-def run():
+def iniciar_servidor():
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 10000))
@@ -51,7 +45,7 @@ def run():
 
 
 # =========================================================
-# DATA E HORÁRIO
+# DATA E HORÁRIO DE BRASÍLIA
 # =========================================================
 
 def formatar_data_hora(commence_time):
@@ -79,7 +73,7 @@ def formatar_data_hora(commence_time):
 
 
 # =========================================================
-# NOME DO MERCADO
+# NOME DOS MERCADOS
 # =========================================================
 
 def nome_mercado(market_key):
@@ -155,7 +149,7 @@ def calcular_consenso(bookmakers, market_key):
 
 
 # =========================================================
-# EV
+# CÁLCULO DO EV
 # =========================================================
 
 def calcular_ev(probabilidade, odd):
@@ -166,14 +160,13 @@ def calcular_ev(probabilidade, odd):
 
 
 # =========================================================
-# BUSCA DE OPORTUNIDADES
+# ANALISA UM JOGO
 # =========================================================
 
 def analisar_jogo(jogo):
 
     bookmakers = jogo.get("bookmakers", [])
 
-    # Precisamos de mais de uma casa para o consenso
     if len(bookmakers) < 2:
         return []
 
@@ -257,14 +250,13 @@ def analisar_jogo(jogo):
                         "odd_justa": odd_justa,
 
                         "ev": ev
-
                     })
 
     return oportunidades
 
 
 # =========================================================
-# BUSCAR JOGOS NA THE ODDS API
+# BUSCA ODDS
 # =========================================================
 
 def buscar_jogos():
@@ -297,7 +289,7 @@ def buscar_jogos():
 
 
 # =========================================================
-# FORMATA ALERTA
+# FORMATA A OPORTUNIDADE
 # =========================================================
 
 def formatar_oportunidade(
@@ -321,58 +313,60 @@ def formatar_oportunidade(
 
     texto = ""
 
-    texto += "🔥 **OPORTUNIDADE EV+**\n\n"
+    texto += "🔥 <b>OPORTUNIDADE EV+</b>\n\n"
 
     texto += (
-        f"⚽ **{home} x {away}**\n"
+        f"⚽ <b>{home} x {away}</b>\n"
     )
 
     texto += (
-        f"📅 **{data_hora} (Brasília)**\n\n"
+        f"📅 <b>{data_hora} (Brasília)</b>\n\n"
     )
 
     texto += (
-        f"🎯 **MERCADO: "
-        f"{oportunidade['mercado']}**\n"
+        f"🎯 <b>MERCADO: "
+        f"{oportunidade['mercado']}</b>\n"
     )
 
     texto += (
-        f"🏦 **APOSTAR EM: "
-        f"{oportunidade['apostar_em']}**\n"
+        f"🏦 <b>APOSTAR EM: "
+        f"{oportunidade['apostar_em']}</b>\n"
     )
 
     texto += (
-        f"💼 **CASA: "
-        f"{oportunidade['casa']}**\n"
+        f"💼 <b>CASA: "
+        f"{oportunidade['casa']}</b>\n"
     )
 
     texto += (
-        f"💰 **ODD: "
-        f"{oportunidade['odd']:.2f}**\n"
+        f"💰 <b>ODD: "
+        f"{oportunidade['odd']:.2f}</b>\n"
     )
 
     texto += (
-        f"📊 **PROBABILIDADE: "
-        f"{oportunidade['prob'] * 100:.1f}%**\n"
+        f"📊 <b>PROBABILIDADE: "
+        f"{oportunidade['prob'] * 100:.1f}%</b>\n"
     )
 
     texto += (
-        f"📐 **ODD JUSTA: "
-        f"{oportunidade['odd_justa']:.2f}**\n"
+        f"📐 <b>ODD JUSTA: "
+        f"{oportunidade['odd_justa']:.2f}</b>\n"
     )
 
     texto += (
-        f"📈 **EV: "
-        f"+{oportunidade['ev']:.2f}%**\n"
+        f"📈 <b>EV: "
+        f"+{oportunidade['ev']:.2f}%</b>\n\n"
     )
 
-    texto += "\n⚠️ EV calculado com base no consenso das odds."
+    texto += (
+        "⚠️ EV baseado no consenso das odds."
+    )
 
     return texto
 
 
 # =========================================================
-# CRIA IDENTIFICADOR ÚNICO
+# IDENTIFICADOR DA OPORTUNIDADE
 # =========================================================
 
 def criar_id_oportunidade(
@@ -404,8 +398,6 @@ def analisar_automaticamente():
 
                 jogos = buscar_jogos()
 
-                oportunidades_totais = []
-
                 for jogo in jogos:
 
                     oportunidades = analisar_jogo(
@@ -428,35 +420,25 @@ def analisar_automaticamente():
                             identificador
                         )
 
-                        oportunidades_totais.append(
-                            (
-                                jogo,
-                                oportunidade
+                        texto = formatar_oportunidade(
+                            jogo,
+                            oportunidade
+                        )
+
+                        try:
+
+                            bot.send_message(
+                                CHAT_ID,
+                                texto,
+                                parse_mode="HTML"
                             )
-                        )
 
-                # Envia as oportunidades encontradas
-                for jogo, oportunidade in oportunidades_totais:
+                        except Exception as erro:
 
-                    texto = formatar_oportunidade(
-                        jogo,
-                        oportunidade
-                    )
-
-                    try:
-
-                        bot.send_message(
-                            CHAT_ID,
-                            texto,
-                            parse_mode="Markdown"
-                        )
-
-                    except Exception as erro:
-
-                        print(
-                            "Erro ao enviar Telegram:",
-                            erro
-                        )
+                            print(
+                                "Erro ao enviar alerta:",
+                                erro
+                            )
 
         except Exception as erro:
 
@@ -471,7 +453,7 @@ def analisar_automaticamente():
 
 
 # =========================================================
-# /START
+# COMANDO START
 # =========================================================
 
 @bot.message_handler(
@@ -494,7 +476,7 @@ def start(message):
 
 
 # =========================================================
-# /ODDS
+# COMANDO ODDS
 # =========================================================
 
 @bot.message_handler(
@@ -542,7 +524,6 @@ def odds(message):
 
             return
 
-        # Maior EV primeiro
         oportunidades_totais.sort(
             key=lambda x: x[1]["ev"],
             reverse=True
@@ -558,7 +539,7 @@ def odds(message):
             bot.send_message(
                 message.chat.id,
                 texto,
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
 
     except requests.exceptions.HTTPError as erro:
@@ -577,7 +558,7 @@ def odds(message):
 
 
 # =========================================================
-# MENSAGENS NÃO RECONHECIDAS
+# COMANDOS NÃO RECONHECIDOS
 # =========================================================
 
 @bot.message_handler(
@@ -593,19 +574,27 @@ def responder(message):
 
 
 # =========================================================
-# INICIALIZAÇÃO
+# INICIA FLASK
 # =========================================================
 
 Thread(
-    target=run,
+    target=iniciar_servidor,
     daemon=True
 ).start()
 
+
+# =========================================================
+# INICIA ANÁLISE AUTOMÁTICA
+# =========================================================
 
 Thread(
     target=analisar_automaticamente,
     daemon=True
 ).start()
 
+
+# =========================================================
+# INICIA TELEGRAM
+# =========================================================
 
 bot.infinity_polling()
