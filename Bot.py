@@ -21,21 +21,36 @@ ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 FOOTBALL_DATA_TOKEN = os.getenv("FOOTBALL_DATA_TOKEN", "").strip()
 
 BANCA = 1000.00
+
+# Kelly fracionado
 KELLY_FRACAO = 0.25
 
+# Filtro principal
 EV_MINIMO = 5.0
 EV_MAXIMO = 20.0
 
+# Número mínimo de casas
 MINIMO_CASAS = 3
+
+# Diferença mínima entre modelo e mercado
+# para considerar o modelo relevante
+DIFERENCA_MODELO_MINIMA = 0.025
+
+# Peso do modelo
+PESO_MODELO = 0.60
+
+# Peso do mercado
+PESO_MERCADO = 0.40
 
 TIMEZONE = ZoneInfo("America/Sao_Paulo")
 
 ODDS_URL = "https://api.the-odds-api.com/v4/sports/{}/odds"
+
 FOOTBALL_DATA_URL = "https://api.football-data.org/v4"
 
 
 # =========================================================
-# TELEGRAM / FLASK
+# FLASK / TELEGRAM
 # =========================================================
 
 app = Flask(__name__)
@@ -43,6 +58,15 @@ app = Flask(__name__)
 bot = telebot.TeleBot(BOT_TOKEN)
 
 CHAT_ID = None
+
+
+# =========================================================
+# CACHE
+# =========================================================
+
+CACHE_FORMA = {}
+
+CACHE_IDS = None
 
 
 # =========================================================
@@ -72,7 +96,7 @@ MERCADOS = [
 
 
 # =========================================================
-# FUNÇÕES BÁSICAS
+# DATA / NOMES
 # =========================================================
 
 def agora_brasilia():
@@ -80,28 +104,34 @@ def agora_brasilia():
 
 
 def normalizar_nome(nome):
+
     if not nome:
         return ""
 
     nome = nome.lower().strip()
 
-    substituicoes = {
-        " fc ": " ",
-        " fc": "",
-        "fc ": "",
-        " cf": "",
-        " cf ": " ",
-        " afc": "",
-        " sc": "",
-        " fk ": " ",
-        " fk": "",
-        "  ": " ",
-    }
+    substituicoes = [
+        (" fc ", " "),
+        (" fc", ""),
+        ("fc ", ""),
+        (" cf ", " "),
+        (" cf", ""),
+        (" afc ", " "),
+        (" afc", ""),
+        (" sc ", " "),
+        (" sc", ""),
+        (" fk ", " "),
+        (" fk", ""),
+        ("  ", " "),
+    ]
 
     nome = f" {nome} "
 
-    for antigo, novo in substituicoes.items():
-        nome = nome.replace(antigo, novo)
+    for antigo, novo in substituicoes:
+        nome = nome.replace(
+            antigo,
+            novo
+        )
 
     return nome.strip()
 
@@ -111,8 +141,9 @@ def normalizar_nome(nome):
 # =========================================================
 
 def poisson(k, lamb):
+
     if lamb <= 0:
-        return 0
+        return 0.0
 
     return (
         math.exp(-lamb)
@@ -122,7 +153,7 @@ def poisson(k, lamb):
 
 
 # =========================================================
-# BUSCAR ODDS
+# ODDS API
 # =========================================================
 
 def buscar_odds(esporte, mercado):
@@ -150,17 +181,17 @@ def buscar_odds(esporte, mercado):
 
         dados = resposta.json()
 
-        if isinstance(dados, list):
-            return dados
+        if not isinstance(dados, list):
+            return []
 
-        return []
+        return dados
 
     except Exception:
         return []
 
 
 # =========================================================
-# RETIRAR MARGEM DA CASA
+# PROBABILIDADE SEM MARGEM
 # =========================================================
 
 def probabilidades_mercado(resultados):
@@ -179,17 +210,20 @@ def probabilidades_mercado(resultados):
             if odd <= 1:
                 continue
 
-            probabilidades[resultado] = 1 / odd
+            probabilidades[resultado] = 1.0 / odd
 
         except Exception:
             continue
 
-    soma = sum(probabilidades.values())
+    soma = sum(
+        probabilidades.values()
+    )
 
     if soma <= 0:
         return {}
 
     for resultado in probabilidades:
+
         probabilidades[resultado] /= soma
 
     return probabilidades
@@ -201,23 +235,22 @@ def probabilidades_mercado(resultados):
 
 def coletar_consenso(jogo, mercado):
 
-    dados_selecoes = {}
+    selecoes = {}
 
-    bookmakers_validos = set()
-
-    for bookmaker in jogo.get("bookmakers", []):
+    for bookmaker in jogo.get(
+        "bookmakers",
+        []
+    ):
 
         nome_casa = bookmaker.get(
             "title",
             "Casa"
         )
 
-        mercados = bookmaker.get(
+        for market in bookmaker.get(
             "markets",
             []
-        )
-
-        for market in mercados:
+        ):
 
             if market.get("key") != mercado:
                 continue
@@ -227,116 +260,83 @@ def coletar_consenso(jogo, mercado):
                 []
             )
 
-            # -----------------------------------------
-            # H2H
-            # -----------------------------------------
+            # =================================================
+            # H2H / BTTS
+            # =================================================
 
-            if mercado == "h2h":
-
-                odds = {}
-
-                for outcome in outcomes:
-
-                    nome = outcome.get("name")
-                    odd = outcome.get("price")
-
-                    if nome and odd:
-                        odds[nome] = odd
-
-                probs = probabilidades_mercado(odds)
-
-                if not probs:
-                    continue
-
-                bookmakers_validos.add(nome_casa)
-
-                for selecao, prob in probs.items():
-
-                    if selecao not in dados_selecoes:
-
-                        dados_selecoes[selecao] = {
-                            "probabilidades": [],
-                            "odds": [],
-                            "casas": []
-                        }
-
-                    dados_selecoes[selecao]["probabilidades"].append(
-                        prob
-                    )
-
-                    try:
-                        odd_float = float(
-                            odds[selecao]
-                        )
-
-                        dados_selecoes[selecao]["odds"].append(
-                            (odd_float, nome_casa)
-                        )
-
-                        dados_selecoes[selecao]["casas"].append(
-                            nome_casa
-                        )
-
-                    except Exception:
-                        pass
-
-            # -----------------------------------------
-            # BTTS
-            # -----------------------------------------
-
-            elif mercado == "btts":
+            if mercado in [
+                "h2h",
+                "btts"
+            ]:
 
                 odds = {}
 
                 for outcome in outcomes:
 
-                    nome = outcome.get("name")
-                    odd = outcome.get("price")
+                    nome = outcome.get(
+                        "name"
+                    )
+
+                    odd = outcome.get(
+                        "price"
+                    )
 
                     if nome and odd:
-                        odds[nome] = odd
 
-                probs = probabilidades_mercado(odds)
+                        try:
+                            odds[nome] = float(
+                                odd
+                            )
+                        except Exception:
+                            pass
+
+                probs = probabilidades_mercado(
+                    odds
+                )
 
                 if not probs:
                     continue
 
-                bookmakers_validos.add(nome_casa)
-
                 for selecao, prob in probs.items():
 
-                    if selecao not in dados_selecoes:
+                    if selecao not in selecoes:
 
-                        dados_selecoes[selecao] = {
+                        selecoes[selecao] = {
                             "probabilidades": [],
                             "odds": [],
-                            "casas": []
+                            "casas": set()
                         }
 
-                    dados_selecoes[selecao]["probabilidades"].append(
-                        prob
-                    )
+                    selecoes[
+                        selecao
+                    ][
+                        "probabilidades"
+                    ].append(prob)
 
-                    try:
+                    if selecao in odds:
 
-                        odd_float = float(
-                            odds[selecao]
+                        selecoes[
+                            selecao
+                        ][
+                            "odds"
+                        ].append(
+                            (
+                                odds[selecao],
+                                nome_casa
+                            )
                         )
 
-                        dados_selecoes[selecao]["odds"].append(
-                            (odd_float, nome_casa)
-                        )
-
-                        dados_selecoes[selecao]["casas"].append(
+                        selecoes[
+                            selecao
+                        ][
+                            "casas"
+                        ].add(
                             nome_casa
                         )
 
-                    except Exception:
-                        pass
-
-            # -----------------------------------------
+            # =================================================
             # TOTALS
-            # -----------------------------------------
+            # =================================================
 
             elif mercado == "totals":
 
@@ -344,9 +344,17 @@ def coletar_consenso(jogo, mercado):
 
                 for outcome in outcomes:
 
-                    nome = outcome.get("name")
-                    ponto = outcome.get("point")
-                    odd = outcome.get("price")
+                    nome = outcome.get(
+                        "name"
+                    )
+
+                    ponto = outcome.get(
+                        "point"
+                    )
+
+                    odd = outcome.get(
+                        "price"
+                    )
 
                     if (
                         nome is None
@@ -356,8 +364,10 @@ def coletar_consenso(jogo, mercado):
                         continue
 
                     try:
+
                         ponto = float(ponto)
                         odd = float(odd)
+
                     except Exception:
                         continue
 
@@ -379,77 +389,82 @@ def coletar_consenso(jogo, mercado):
                     if not probs:
                         continue
 
-                    bookmakers_validos.add(nome_casa)
-
                     try:
+
                         ponto = float(
-                            chave.split("_")[-1]
+                            chave.rsplit(
+                                "_",
+                                1
+                            )[1]
                         )
+
                     except Exception:
                         continue
 
                     for selecao, prob in probs.items():
 
-                        chave_final = (
+                        chave_selecao = (
                             f"{selecao}_{ponto}"
                         )
 
-                        if chave_final not in dados_selecoes:
+                        if (
+                            chave_selecao
+                            not in selecoes
+                        ):
 
-                            dados_selecoes[chave_final] = {
+                            selecoes[
+                                chave_selecao
+                            ] = {
+                                "selecao": selecao,
+                                "point": ponto,
                                 "probabilidades": [],
                                 "odds": [],
-                                "casas": [],
-                                "selecao": selecao,
-                                "point": ponto
+                                "casas": set()
                             }
 
-                        dados_selecoes[chave_final]["probabilidades"].append(
-                            prob
-                        )
+                        selecoes[
+                            chave_selecao
+                        ][
+                            "probabilidades"
+                        ].append(prob)
 
-                        try:
+                        if selecao in odds:
 
-                            odd_float = float(
-                                odds[selecao]
-                            )
-
-                            dados_selecoes[chave_final]["odds"].append(
+                            selecoes[
+                                chave_selecao
+                            ][
+                                "odds"
+                            ].append(
                                 (
-                                    odd_float,
+                                    odds[selecao],
                                     nome_casa
                                 )
                             )
 
-                            dados_selecoes[chave_final]["casas"].append(
+                            selecoes[
+                                chave_selecao
+                            ][
+                                "casas"
+                            ].add(
                                 nome_casa
                             )
 
-                        except Exception:
-                            pass
+    # =====================================================
+    # TRANSFORMAR EM CONSENSO FINAL
+    # =====================================================
 
     resultado = {}
 
-    for chave, dados in dados_selecoes.items():
+    for chave, dados in selecoes.items():
 
         probabilidades = dados.get(
             "probabilidades",
             []
         )
 
-        if not probabilidades:
-            continue
-
-        casas = set(
-            dados.get("casas", [])
-        )
-
-        if len(casas) < MINIMO_CASAS:
-            continue
-
-        # MEDIANA = mais resistente a uma casa discrepante
-        probabilidade_consenso = statistics.median(
-            probabilidades
+        casas = dados.get(
+            "casas",
+            set()
         )
 
         odds = dados.get(
@@ -457,8 +472,20 @@ def coletar_consenso(jogo, mercado):
             []
         )
 
+        if not probabilidades:
+            continue
+
+        if len(casas) < MINIMO_CASAS:
+            continue
+
         if not odds:
             continue
+
+        # Mediana é mais resistente
+        # a uma casa discrepante.
+        probabilidade = statistics.median(
+            probabilidades
+        )
 
         # Melhor odd disponível
         melhor_odd, melhor_casa = max(
@@ -466,36 +493,34 @@ def coletar_consenso(jogo, mercado):
             key=lambda x: x[0]
         )
 
-        if mercado == "totals":
+        dispersao = (
+            max(probabilidades)
+            - min(probabilidades)
+        )
 
-            selecao = dados.get(
-                "selecao"
-            )
+        resultado[chave] = {
 
-            ponto = dados.get(
+            "selecao": dados.get(
+                "selecao",
+                chave
+            ),
+
+            "point": dados.get(
                 "point"
-            )
+            ),
 
-            chave_saida = (
-                f"{selecao}_{ponto}"
-            )
+            "probabilidade": probabilidade,
 
-        else:
-
-            selecao = chave
-            chave_saida = selecao
-
-        resultado[chave_saida] = {
-            "selecao": selecao,
-            "point": dados.get("point"),
-            "probabilidade": probabilidade_consenso,
             "odd": melhor_odd,
+
             "casa": melhor_casa,
-            "numero_casas": len(casas),
-            "casas": sorted(casas),
-            "dispersao": (
-                max(probabilidades)
-                - min(probabilidades)
+
+            "casas": len(casas),
+
+            "dispersao": dispersao,
+
+            "lista_casas": sorted(
+                casas
             )
         }
 
@@ -503,7 +528,7 @@ def coletar_consenso(jogo, mercado):
 
 
 # =========================================================
-# FOOTBALL-DATA
+# FOOTBALL-DATA.ORG
 # =========================================================
 
 def football_data_request(endpoint):
@@ -514,7 +539,8 @@ def football_data_request(endpoint):
     try:
 
         headers = {
-            "X-Auth-Token": FOOTBALL_DATA_TOKEN
+            "X-Auth-Token":
+                FOOTBALL_DATA_TOKEN
         }
 
         resposta = requests.get(
@@ -533,6 +559,65 @@ def football_data_request(endpoint):
 
 
 # =========================================================
+# BUSCAR IDS DAS EQUIPES
+# =========================================================
+
+def buscar_ids_equipes():
+
+    global CACHE_IDS
+
+    if CACHE_IDS is not None:
+        return CACHE_IDS
+
+    if not FOOTBALL_DATA_TOKEN:
+        CACHE_IDS = {}
+        return CACHE_IDS
+
+    ids = {}
+
+    competicoes = [
+        "BSA",
+        "PL",
+        "BL1",
+        "SA",
+        "FL1",
+        "PD"
+    ]
+
+    for codigo in competicoes:
+
+        dados = football_data_request(
+            f"/competitions/{codigo}/teams"
+        )
+
+        if not dados:
+            continue
+
+        for equipe in dados.get(
+            "teams",
+            []
+        ):
+
+            nome = equipe.get(
+                "name"
+            )
+
+            team_id = equipe.get(
+                "id"
+            )
+
+            if nome and team_id:
+
+                ids[
+                    normalizar_nome(nome)
+                ] = team_id
+
+    CACHE_IDS = ids
+
+    return CACHE_IDS
+
+
+# =========================================================
 # HISTÓRICO DA EQUIPE
 # =========================================================
 
@@ -545,7 +630,7 @@ def obter_jogos_equipe(
 
     data_inicial = (
         data_final
-        - timedelta(days=120)
+        - timedelta(days=150)
     )
 
     endpoint = (
@@ -587,22 +672,33 @@ def calcular_forma_equipe(
     team_id
 ):
 
+    if team_id in CACHE_FORMA:
+
+        return CACHE_FORMA[
+            team_id
+        ]
+
     jogos = obter_jogos_equipe(
         team_id,
         10
     )
 
     if not jogos:
+
+        CACHE_FORMA[
+            team_id
+        ] = None
+
         return None
 
     gols_marcados = []
     gols_sofridos = []
 
-    gols_casa_marcados = []
-    gols_casa_sofridos = []
+    casa_marcados = []
+    casa_sofridos = []
 
-    gols_fora_marcados = []
-    gols_fora_sofridos = []
+    fora_marcados = []
+    fora_sofridos = []
 
     resultados = []
 
@@ -632,26 +728,28 @@ def calcular_forma_equipe(
         if hg is None or ag is None:
             continue
 
-        home_id = home.get("id")
-        away_id = away.get("id")
+        home_id = home.get(
+            "id"
+        )
+
+        away_id = away.get(
+            "id"
+        )
 
         if home_id == team_id:
 
             marcados = hg
             sofridos = ag
 
-            gols_casa_marcados.append(
-                hg
-            )
-
-            gols_casa_sofridos.append(
-                ag
-            )
+            casa_marcados.append(hg)
+            casa_sofridos.append(ag)
 
             if hg > ag:
                 resultados.append("V")
+
             elif hg == ag:
                 resultados.append("E")
+
             else:
                 resultados.append("D")
 
@@ -660,18 +758,15 @@ def calcular_forma_equipe(
             marcados = ag
             sofridos = hg
 
-            gols_fora_marcados.append(
-                ag
-            )
-
-            gols_fora_sofridos.append(
-                hg
-            )
+            fora_marcados.append(ag)
+            fora_sofridos.append(hg)
 
             if ag > hg:
                 resultados.append("V")
+
             elif ag == hg:
                 resultados.append("E")
+
             else:
                 resultados.append("D")
 
@@ -686,8 +781,17 @@ def calcular_forma_equipe(
             sofridos
         )
 
-    if not gols_marcados:
+    if len(gols_marcados) < 5:
+
+        CACHE_FORMA[
+            team_id
+        ] = None
+
         return None
+
+    # =====================================================
+    # PESOS
+    # =====================================================
 
     pesos = []
 
@@ -697,15 +801,18 @@ def calcular_forma_equipe(
 
         if i < 5:
             pesos.append(1.5)
+
         else:
             pesos.append(1.0)
 
-    soma_pesos = sum(pesos)
+    soma_pesos = sum(
+        pesos
+    )
 
     media_marcados = (
         sum(
-            x * p
-            for x, p in zip(
+            g * p
+            for g, p in zip(
                 gols_marcados,
                 pesos
             )
@@ -715,8 +822,8 @@ def calcular_forma_equipe(
 
     media_sofridos = (
         sum(
-            x * p
-            for x, p in zip(
+            g * p
+            for g, p in zip(
                 gols_sofridos,
                 pesos
             )
@@ -731,70 +838,119 @@ def calcular_forma_equipe(
 
         return sum(lista) / len(lista)
 
-    return {
+    resultado = {
+
         "jogos": len(
             gols_marcados
         ),
 
-        "gols_marcados": media_marcados,
+        "gols_marcados":
+            media_marcados,
 
-        "gols_sofridos": media_sofridos,
+        "gols_sofridos":
+            media_sofridos,
 
-        "casa_marcados": media(
-            gols_casa_marcados,
-            media_marcados
-        ),
+        "casa_marcados":
+            media(
+                casa_marcados,
+                media_marcados
+            ),
 
-        "casa_sofridos": media(
-            gols_casa_sofridos,
-            media_sofridos
-        ),
+        "casa_sofridos":
+            media(
+                casa_sofridos,
+                media_sofridos
+            ),
 
-        "fora_marcados": media(
-            gols_fora_marcados,
-            media_marcados
-        ),
+        "fora_marcados":
+            media(
+                fora_marcados,
+                media_marcados
+            ),
 
-        "fora_sofridos": media(
-            gols_fora_sofridos,
-            media_sofridos
-        ),
+        "fora_sofridos":
+            media(
+                fora_sofridos,
+                media_sofridos
+            ),
 
-        "forma": resultados[:5]
+        "forma":
+            resultados[:5]
     }
+
+    CACHE_FORMA[
+        team_id
+    ] = resultado
+
+    return resultado
 
 
 # =========================================================
-# MODELO POISSON
+# MODELO DE GOLS
 # =========================================================
 
 def modelo_poisson(
-    formacasa,
-    formafora
+    forma_casa,
+    forma_fora
 ):
 
-    if not formacasa or not formafora:
+    if (
+        not forma_casa
+        or not forma_fora
+    ):
         return None
 
-    ataque_casa = (
-        formacasa["casa_marcados"] * 0.60
-        + formacasa["gols_marcados"] * 0.40
-    )
+    # =====================================================
+    # ATAQUE
+    # =====================================================
 
-    defesa_fora = (
-        formafora["fora_sofridos"] * 0.60
-        + formafora["gols_sofridos"] * 0.40
+    ataque_casa = (
+        forma_casa[
+            "casa_marcados"
+        ] * 0.65
+
+        + forma_casa[
+            "gols_marcados"
+        ] * 0.35
     )
 
     ataque_fora = (
-        formafora["fora_marcados"] * 0.60
-        + formafora["gols_marcados"] * 0.40
+        forma_fora[
+            "fora_marcados"
+        ] * 0.65
+
+        + forma_fora[
+            "gols_marcados"
+        ] * 0.35
     )
 
+    # =====================================================
+    # DEFESA
+    # =====================================================
+
     defesa_casa = (
-        formacasa["casa_sofridos"] * 0.60
-        + formacasa["gols_sofridos"] * 0.40
+        forma_casa[
+            "casa_sofridos"
+        ] * 0.65
+
+        + forma_casa[
+            "gols_sofridos"
+        ] * 0.35
     )
+
+    defesa_fora = (
+        forma_fora[
+            "fora_sofridos"
+        ] * 0.65
+
+        + forma_fora[
+            "gols_sofridos"
+        ] * 0.35
+    )
+
+    # =====================================================
+    # EXPECTATIVA DE GOLS
+    # =====================================================
 
     lambda_casa = (
         ataque_casa * 0.55
@@ -806,50 +962,69 @@ def modelo_poisson(
         + defesa_casa * 0.45
     )
 
+    # Limites de segurança
     lambda_casa = max(
-        0.15,
-        min(lambda_casa, 4.5)
+        0.20,
+        min(
+            lambda_casa,
+            4.00
+        )
     )
 
     lambda_fora = max(
-        0.15,
-        min(lambda_fora, 4.5)
+        0.20,
+        min(
+            lambda_fora,
+            4.00
+        )
     )
 
-    prob_casa = 0
-    prob_empate = 0
-    prob_fora = 0
+    # =====================================================
+    # PROBABILIDADES
+    # =====================================================
 
-    prob_over_15 = 0
-    prob_over_25 = 0
-    prob_over_35 = 0
+    prob_casa = 0.0
+    prob_empate = 0.0
+    prob_fora = 0.0
 
-    prob_btts = 0
+    prob_over_15 = 0.0
+    prob_over_25 = 0.0
+    prob_over_35 = 0.0
 
-    for gols_casa in range(0, 11):
+    prob_btts = 0.0
+
+    # 0-12 gols para reduzir
+    # truncamento do modelo
+    for gols_casa in range(0, 13):
 
         p_casa = poisson(
             gols_casa,
             lambda_casa
         )
 
-        for gols_fora in range(0, 11):
+        for gols_fora in range(0, 13):
 
             p_fora = poisson(
                 gols_fora,
                 lambda_fora
             )
 
-            p = p_casa * p_fora
+            prob = (
+                p_casa
+                * p_fora
+            )
 
             if gols_casa > gols_fora:
-                prob_casa += p
+
+                prob_casa += prob
 
             elif gols_casa == gols_fora:
-                prob_empate += p
+
+                prob_empate += prob
 
             else:
-                prob_fora += p
+
+                prob_fora += prob
 
             total = (
                 gols_casa
@@ -857,129 +1032,105 @@ def modelo_poisson(
             )
 
             if total >= 2:
-                prob_over_15 += p
+                prob_over_15 += prob
 
             if total >= 3:
-                prob_over_25 += p
+                prob_over_25 += prob
 
             if total >= 4:
-                prob_over_35 += p
+                prob_over_35 += prob
 
             if (
                 gols_casa > 0
                 and gols_fora > 0
             ):
-                prob_btts += p
+                prob_btts += prob
+
+    # =====================================================
+    # NORMALIZAR 1X2
+    # =====================================================
+
+    soma_1x2 = (
+        prob_casa
+        + prob_empate
+        + prob_fora
+    )
+
+    if soma_1x2 > 0:
+
+        prob_casa /= soma_1x2
+        prob_empate /= soma_1x2
+        prob_fora /= soma_1x2
 
     return {
 
-        "casa": prob_casa,
+        "casa":
+            prob_casa,
 
-        "empate": prob_empate,
+        "empate":
+            prob_empate,
 
-        "fora": prob_fora,
+        "fora":
+            prob_fora,
 
-        "over_1.5": prob_over_15,
+        "over_1.5":
+            prob_over_15,
 
-        "under_1.5": 1 - prob_over_15,
+        "under_1.5":
+            1 - prob_over_15,
 
-        "over_2.5": prob_over_25,
+        "over_2.5":
+            prob_over_25,
 
-        "under_2.5": 1 - prob_over_25,
+        "under_2.5":
+            1 - prob_over_25,
 
-        "over_3.5": prob_over_35,
+        "over_3.5":
+            prob_over_35,
 
-        "under_3.5": 1 - prob_over_35,
+        "under_3.5":
+            1 - prob_over_35,
 
-        "btts_yes": prob_btts,
+        "btts_yes":
+            prob_btts,
 
-        "btts_no": 1 - prob_btts,
+        "btts_no":
+            1 - prob_btts,
 
-        "lambda_casa": lambda_casa,
+        "lambda_casa":
+            lambda_casa,
 
-        "lambda_fora": lambda_fora
+        "lambda_fora":
+            lambda_fora
     }
 
 
 # =========================================================
-# COMBINAR MODELO + MERCADO
+# PROBABILIDADE DO MODELO PARA CADA SELEÇÃO
 # =========================================================
 
-def combinar_probabilidades(
-    prob_mercado,
-    prob_modelo
-):
-
-    if prob_modelo is None:
-        return prob_mercado
-
-    # 60% modelo
-    # 40% mercado
-
-    return (
-        prob_modelo * 0.60
-        + prob_mercado * 0.40
-    )
-
-
-# =========================================================
-# KELLY
-# =========================================================
-
-def calcular_kelly(
-    probabilidade,
-    odd
-):
-
-    b = odd - 1
-    q = 1 - probabilidade
-
-    if b <= 0:
-        return 0
-
-    kelly = (
-        (b * probabilidade) - q
-    ) / b
-
-    if kelly < 0:
-        kelly = 0
-
-    kelly *= KELLY_FRACAO
-
-    # Máximo de 5% da banca
-    kelly = min(
-        kelly,
-        0.05
-    )
-
-    return BANCA * kelly
-
-
-# =========================================================
-# PROBABILIDADE DO MODELO
-# =========================================================
-
-def probabilidade_modelo_para_selecao(
+def probabilidade_modelo(
     mercado,
     selecao,
     ponto,
-    jogo,
+    home,
+    away,
     modelo
 ):
 
     if not modelo:
         return None
 
-    casa = jogo["home_team"]
-    fora = jogo["away_team"]
+    # =====================================================
+    # 1X2
+    # =====================================================
 
-    # H2H
     if mercado == "h2h":
 
-        if selecao == casa:
+        if selecao == home:
             return modelo["casa"]
 
-        if selecao == fora:
+        if selecao == away:
             return modelo["fora"]
 
         if selecao.lower() in [
@@ -988,7 +1139,10 @@ def probabilidade_modelo_para_selecao(
         ]:
             return modelo["empate"]
 
+    # =====================================================
     # BTTS
+    # =====================================================
+
     if mercado == "btts":
 
         if selecao.lower() in [
@@ -1004,13 +1158,19 @@ def probabilidade_modelo_para_selecao(
         ]:
             return modelo["btts_no"]
 
+    # =====================================================
     # TOTALS
+    # =====================================================
+
     if mercado == "totals":
 
         if ponto is None:
             return None
 
-        ponto = float(ponto)
+        try:
+            ponto = float(ponto)
+        except Exception:
+            return None
 
         if selecao.lower() == "over":
 
@@ -1038,54 +1198,41 @@ def probabilidade_modelo_para_selecao(
 
 
 # =========================================================
-# IDS DAS EQUIPES
+# MODELO DO JOGO
 # =========================================================
 
-def buscar_ids_equipes():
+def obter_modelo_jogo(
+    home,
+    away,
+    ids_equipes
+):
 
-    if not FOOTBALL_DATA_TOKEN:
-        return {}
+    if not ids_equipes:
+        return None
 
-    ids = {}
+    home_id = ids_equipes.get(
+        normalizar_nome(home)
+    )
 
-    competicoes = [
-        "BSA",
-        "PL",
-        "BL1",
-        "SA",
-        "FL1",
-        "PD"
-    ]
+    away_id = ids_equipes.get(
+        normalizar_nome(away)
+    )
 
-    for codigo in competicoes:
+    if not home_id or not away_id:
+        return None
 
-        dados = football_data_request(
-            f"/competitions/{codigo}/teams"
-        )
+    forma_home = calcular_forma_equipe(
+        home_id
+    )
 
-        if not dados:
-            continue
+    forma_away = calcular_forma_equipe(
+        away_id
+    )
 
-        for equipe in dados.get(
-            "teams",
-            []
-        ):
-
-            nome = equipe.get(
-                "name"
-            )
-
-            team_id = equipe.get(
-                "id"
-            )
-
-            if nome and team_id:
-
-                ids[
-                    normalizar_nome(nome)
-                ] = team_id
-
-    return ids
+    return modelo_poisson(
+        forma_home,
+        forma_away
+    )
 
 
 # =========================================================
@@ -1110,42 +1257,13 @@ def analisar_jogo(
     if not home or not away:
         return []
 
+    modelo = obter_modelo_jogo(
+        home,
+        away,
+        ids_equipes
+    )
+
     resultados = []
-
-    modelo = None
-
-    # -----------------------------------------
-    # BUSCAR MODELO
-    # -----------------------------------------
-
-    if ids_equipes:
-
-        home_id = ids_equipes.get(
-            normalizar_nome(home)
-        )
-
-        away_id = ids_equipes.get(
-            normalizar_nome(away)
-        )
-
-        if home_id and away_id:
-
-            forma_home = calcular_forma_equipe(
-                home_id
-            )
-
-            forma_away = calcular_forma_equipe(
-                away_id
-            )
-
-            modelo = modelo_poisson(
-                forma_home,
-                forma_away
-            )
-
-    # -----------------------------------------
-    # ANALISAR CADA SELEÇÃO
-    # -----------------------------------------
 
     for chave, dados in consenso.items():
 
@@ -1154,27 +1272,32 @@ def analisar_jogo(
             chave
         )
 
-        odd = dados.get(
-            "odd"
+        ponto = dados.get(
+            "point"
         )
 
         prob_market = dados.get(
             "probabilidade"
         )
 
-        numero_casas = dados.get(
-            "numero_casas",
-            0
+        odd = dados.get(
+            "odd"
         )
 
-        if odd is None or prob_market is None:
+        if (
+            prob_market is None
+            or odd is None
+        ):
             continue
 
         try:
 
-            odd = float(odd)
             prob_market = float(
                 prob_market
+            )
+
+            odd = float(
+                odd
             )
 
         except Exception:
@@ -1183,92 +1306,141 @@ def analisar_jogo(
         if odd <= 1:
             continue
 
-        # Ponto do total
-        ponto = dados.get(
-            "point"
+        # =================================================
+        # PROBABILIDADE DO MODELO
+        # =================================================
+
+        prob_modelo = probabilidade_modelo(
+            mercado,
+            selecao,
+            ponto,
+            home,
+            away,
+            modelo
         )
 
-        prob_modelo = (
-            probabilidade_modelo_para_selecao(
-                mercado,
-                selecao,
-                ponto,
-                {
-                    "home_team": home,
-                    "away_team": away
-                },
-                modelo
-            )
-        )
-
-        # -----------------------------------------
-        # PROBABILIDADE FINAL
-        # -----------------------------------------
+        # =================================================
+        # COMBINAÇÃO
+        # =================================================
 
         if prob_modelo is not None:
 
-            prob_final = combinar_probabilidades(
-                prob_market,
+            diferenca = (
                 prob_modelo
+                - prob_market
             )
 
-            origem = "Poisson + mercado"
+            # Só mistura o modelo se ele
+            # estiver razoavelmente afastado
+            # do mercado.
+            if abs(diferenca) >= DIFERENCA_MODELO_MINIMA:
+
+                prob_final = (
+                    prob_modelo
+                    * PESO_MODELO
+                    +
+                    prob_market
+                    * PESO_MERCADO
+                )
+
+                origem = (
+                    "Poisson + mercado"
+                )
+
+                modelo_utilizado = True
+
+            else:
+
+                # Quando modelo e mercado
+                # estão muito próximos,
+                # usamos o consenso de mercado.
+                prob_final = prob_market
+
+                origem = (
+                    "consenso das casas"
+                )
+
+                modelo_utilizado = False
 
         else:
 
             prob_final = prob_market
 
-            origem = "consenso das casas"
+            origem = (
+                "consenso das casas"
+            )
 
-        if prob_final <= 0:
-            continue
+            modelo_utilizado = False
 
-        # -----------------------------------------
+        # =================================================
         # EV
-        # -----------------------------------------
+        # =================================================
 
         ev = (
-            (prob_final * odd) - 1
+            (
+                prob_final
+                * odd
+            ) - 1
         ) * 100
 
-        # -----------------------------------------
+        # =================================================
         # ODD JUSTA
-        # -----------------------------------------
+        # =================================================
 
-        odd_justa = (
-            1 / prob_final
-        )
+        if prob_final > 0:
 
-        # -----------------------------------------
+            odd_justa = (
+                1 / prob_final
+            )
+
+        else:
+
+            odd_justa = 0
+
+        # =================================================
         # KELLY
-        # -----------------------------------------
+        # =================================================
 
         stake = calcular_kelly(
             prob_final,
             odd
         )
 
-        # -----------------------------------------
-        # DISPERSÃO DAS CASAS
-        # -----------------------------------------
+        # =================================================
+        # CONSISTÊNCIA DO MERCADO
+        # =================================================
 
         dispersao = dados.get(
             "dispersao",
             0
         )
 
-        # -----------------------------------------
-        # NÍVEL DE CONSISTÊNCIA
-        # -----------------------------------------
-
         if dispersao <= 0.025:
+
             consistencia = "alta"
 
         elif dispersao <= 0.05:
+
             consistencia = "média"
 
         else:
+
             consistencia = "baixa"
+
+        # =================================================
+        # DIFERENÇA MODELO / MERCADO
+        # =================================================
+
+        if prob_modelo is not None:
+
+            diferenca_modelo = (
+                prob_modelo
+                - prob_market
+            )
+
+        else:
+
+            diferenca_modelo = None
 
         resultados.append({
 
@@ -1280,6 +1452,8 @@ def analisar_jogo(
 
             "selecao": selecao,
 
+            "point": ponto,
+
             "odd": odd,
 
             "casa": dados.get(
@@ -1287,37 +1461,99 @@ def analisar_jogo(
                 "Mercado"
             ),
 
-            "probabilidade": prob_final,
+            "probabilidade":
+                prob_final,
 
-            "prob_market": prob_market,
+            "prob_market":
+                prob_market,
 
-            "prob_modelo": prob_modelo,
+            "prob_modelo":
+                prob_modelo,
 
-            "odd_justa": odd_justa,
+            "diferenca_modelo":
+                diferenca_modelo,
 
-            "ev": ev,
+            "odd_justa":
+                odd_justa,
 
-            "stake": stake,
+            "ev":
+                ev,
 
-            "origem": origem,
+            "stake":
+                stake,
 
-            "modelo": modelo is not None,
+            "casas":
+                dados.get(
+                    "casas",
+                    0
+                ),
 
-            "casas": numero_casas,
+            "dispersao":
+                dispersao,
 
-            "dispersao": dispersao,
+            "consistencia":
+                consistencia,
 
-            "consistencia": consistencia
+            "origem":
+                origem,
+
+            "modelo":
+                modelo_utilizado
         })
 
     return resultados
 
 
 # =========================================================
-# ANALISAR TUDO
+# KELLY
+# =========================================================
+
+def calcular_kelly(
+    probabilidade,
+    odd
+):
+
+    if (
+        probabilidade <= 0
+        or odd <= 1
+    ):
+        return 0.0
+
+    b = odd - 1
+
+    q = 1 - probabilidade
+
+    kelly = (
+        (
+            b
+            * probabilidade
+        )
+        - q
+    ) / b
+
+    if kelly < 0:
+        return 0.0
+
+    kelly *= KELLY_FRACAO
+
+    # Limite máximo de 5%
+    kelly = min(
+        kelly,
+        0.05
+    )
+
+    return BANCA * kelly
+
+
+# =========================================================
+# ANALISAR TODOS OS JOGOS
 # =========================================================
 
 def analisar_tudo():
+
+    # Limpa cache de forma
+    # a cada nova análise.
+    CACHE_FORMA.clear()
 
     amanha = (
         agora_brasilia().date()
@@ -1327,7 +1563,7 @@ def analisar_tudo():
     jogos_unicos = {}
 
     # =====================================================
-    # MANTÉM A MESMA COLETA QUE JÁ ESTAVA FUNCIONANDO
+    # COLETA ORIGINAL
     # =====================================================
 
     for esporte in COMPETICOES:
@@ -1359,7 +1595,9 @@ def analisar_tudo():
 
                     data_local = (
                         data_utc
-                        .astimezone(TIMEZONE)
+                        .astimezone(
+                            TIMEZONE
+                        )
                         .date()
                     )
 
@@ -1392,15 +1630,19 @@ def analisar_tudo():
                         "mercados": {}
                     }
 
-                jogos_unicos[jogo_id][
+                jogos_unicos[
+                    jogo_id
+                ][
                     "mercados"
-                ][mercado] = evento
+                ][
+                    mercado
+                ] = evento
 
     total_jogos = len(
         jogos_unicos
     )
 
-    if not jogos_unicos:
+    if total_jogos == 0:
 
         return {
             "total_jogos": 0,
@@ -1414,10 +1656,10 @@ def analisar_tudo():
 
     ids_equipes = buscar_ids_equipes()
 
-    todas_oportunidades = []
+    todas = []
 
     # =====================================================
-    # ANALISAR JOGOS
+    # ANALISAR
     # =====================================================
 
     for jogo_id, dados_jogo in jogos_unicos.items():
@@ -1445,7 +1687,7 @@ def analisar_tudo():
                 ids_equipes
             )
 
-            todas_oportunidades.extend(
+            todas.extend(
                 resultados
             )
 
@@ -1453,18 +1695,19 @@ def analisar_tudo():
     # REMOVER DUPLICADOS
     # =====================================================
 
-    melhores_por_selecao = {}
+    unicos = {}
 
-    for op in todas_oportunidades:
+    for op in todas:
 
         chave = (
             op["home"],
             op["away"],
             op["mercado"],
-            op["selecao"]
+            op["selecao"],
+            op.get("point")
         )
 
-        atual = melhores_por_selecao.get(
+        atual = unicos.get(
             chave
         )
 
@@ -1472,16 +1715,15 @@ def analisar_tudo():
             atual is None
             or op["ev"] > atual["ev"]
         ):
-            melhores_por_selecao[
-                chave
-            ] = op
+
+            unicos[chave] = op
 
     finais = list(
-        melhores_por_selecao.values()
+        unicos.values()
     )
 
     # =====================================================
-    # ORDENAR POR EV
+    # ORDENAR
     # =====================================================
 
     finais.sort(
@@ -1490,10 +1732,10 @@ def analisar_tudo():
     )
 
     # =====================================================
-    # FILTRO EV
+    # EV+
     # =====================================================
 
-    oportunidades_ev = [
+    oportunidades = [
 
         op
 
@@ -1501,23 +1743,29 @@ def analisar_tudo():
 
         if (
             op["ev"] >= EV_MINIMO
-            and op["ev"] <= EV_MAXIMO
+            and
+            op["ev"] <= EV_MAXIMO
         )
     ]
 
-    oportunidades_ev.sort(
+    oportunidades.sort(
         key=lambda x: x["ev"],
         reverse=True
     )
+
+    # =====================================================
+    # MELHORES 5
+    # =====================================================
 
     melhores = finais[:5]
 
     return {
 
-        "total_jogos": total_jogos,
+        "total_jogos":
+            total_jogos,
 
         "oportunidades":
-            oportunidades_ev[:20],
+            oportunidades[:20],
 
         "melhores":
             melhores
@@ -1525,7 +1773,7 @@ def analisar_tudo():
 
 
 # =========================================================
-# FORMATAR TELEGRAM
+# FORMATAR OP
 # =========================================================
 
 def formatar_oportunidade(
@@ -1533,18 +1781,6 @@ def formatar_oportunidade(
     numero,
     abaixo_do_filtro=False
 ):
-
-    if op["modelo"]:
-
-        modelo_texto = (
-            "Poisson + mercado"
-        )
-
-    else:
-
-        modelo_texto = (
-            "consenso das casas"
-        )
 
     if abaixo_do_filtro:
 
@@ -1558,7 +1794,19 @@ def formatar_oportunidade(
             f"🔥 EV+ #{numero}"
         )
 
-    return (
+    if op["modelo"]:
+
+        modelo_texto = (
+            "Poisson + mercado"
+        )
+
+    else:
+
+        modelo_texto = (
+            "consenso das casas"
+        )
+
+    texto = (
 
         f"{titulo}\n\n"
 
@@ -1571,7 +1819,23 @@ def formatar_oportunidade(
         f"{op['mercado']}\n"
 
         f"🎯 Entrada: "
-        f"{op['selecao']}\n\n"
+        f"{op['selecao']}\n"
+    )
+
+    # Mostrar ponto para totals
+    if (
+        op["mercado"] == "totals"
+        and op.get("point") is not None
+    ):
+
+        texto += (
+            f"📏 Linha: "
+            f"{op['point']:.1f}\n"
+        )
+
+    texto += (
+
+        f"\n"
 
         f"🏦 Melhor casa: "
         f"{op['casa']}\n"
@@ -1594,19 +1858,35 @@ def formatar_oportunidade(
         f"🏦 Casas consideradas: "
         f"{op['casas']}\n"
 
-        f"📊 Consistência do mercado: "
+        f"📊 Consistência: "
         f"{op['consistencia']}\n"
 
         f"🧠 Modelo: "
-        f"{modelo_texto}\n\n"
-
-        f"⚠️ Estimativa estatística. "
-        f"Não garante resultado."
+        f"{modelo_texto}\n"
     )
+
+    if op["prob_modelo"] is not None:
+
+        texto += (
+
+            f"📊 Prob. modelo: "
+            f"{op['prob_modelo'] * 100:.1f}%\n"
+
+            f"📊 Prob. mercado: "
+            f"{op['prob_market'] * 100:.1f}%\n"
+        )
+
+    texto += (
+
+        "\n⚠️ Estimativa estatística. "
+        "Não garante resultado."
+    )
+
+    return texto
 
 
 # =========================================================
-# /START
+# START
 # =========================================================
 
 @bot.message_handler(
@@ -1630,7 +1910,7 @@ def start(message):
 
 
 # =========================================================
-# /ODDS
+# ODDS
 # =========================================================
 
 @bot.message_handler(
@@ -1664,9 +1944,9 @@ def odds(message):
         "melhores"
     ]
 
-    # -----------------------------------------
-    # NENHUM JOGO
-    # -----------------------------------------
+    # =====================================================
+    # ZERO JOGOS
+    # =====================================================
 
     if total_jogos == 0:
 
@@ -1685,9 +1965,9 @@ def odds(message):
 
         return
 
-    # -----------------------------------------
-    # ENCONTROU EV+
-    # -----------------------------------------
+    # =====================================================
+    # EV+
+    # =====================================================
 
     if oportunidades:
 
@@ -1711,7 +1991,7 @@ def odds(message):
             f"{MINIMO_CASAS}"
         )
 
-        for i, oportunidade in enumerate(
+        for i, op in enumerate(
             oportunidades,
             start=1
         ):
@@ -1723,7 +2003,7 @@ def odds(message):
                     message.chat.id,
 
                     formatar_oportunidade(
-                        oportunidade,
+                        op,
                         i
                     )
                 )
@@ -1735,9 +2015,9 @@ def odds(message):
 
         return
 
-    # -----------------------------------------
+    # =====================================================
     # SEM EV+
-    # -----------------------------------------
+    # =====================================================
 
     bot.send_message(
 
@@ -1761,14 +2041,13 @@ def odds(message):
         f"Mínimo de casas: "
         f"{MINIMO_CASAS}\n\n"
 
-        "🔎 Abaixo estão as 5 "
-        "melhores oportunidades "
-        "encontradas."
+        "🔎 Enviando as 5 melhores "
+        "seleções encontradas."
     )
 
     if melhores:
 
-        for i, oportunidade in enumerate(
+        for i, op in enumerate(
             melhores,
             start=1
         ):
@@ -1780,7 +2059,7 @@ def odds(message):
                     message.chat.id,
 
                     formatar_oportunidade(
-                        oportunidade,
+                        op,
                         i,
                         abaixo_do_filtro=True
                     )
@@ -1799,8 +2078,7 @@ def odds(message):
 
             "ℹ️ Nenhuma seleção válida "
             f"com pelo menos "
-            f"{MINIMO_CASAS} casas "
-            "foi encontrada."
+            f"{MINIMO_CASAS} casas."
         )
 
 
@@ -1827,7 +2105,7 @@ def outras_mensagens(message):
 
 
 # =========================================================
-# ROTINA DIÁRIA
+# ROTINA AUTOMÁTICA
 # =========================================================
 
 def rotina_diaria():
@@ -1874,7 +2152,7 @@ def rotina_diaria():
                             f"{len(oportunidades)}"
                         )
 
-                        for i, oportunidade in enumerate(
+                        for i, op in enumerate(
                             oportunidades,
                             start=1
                         ):
@@ -1884,7 +2162,7 @@ def rotina_diaria():
                                 CHAT_ID,
 
                                 formatar_oportunidade(
-                                    oportunidade,
+                                    op,
                                     i
                                 )
                             )
@@ -1905,11 +2183,10 @@ def rotina_diaria():
                             "❌ Nenhuma oportunidade "
                             "EV+ dentro dos filtros.\n\n"
 
-                            "🔎 Enviando as 5 melhores "
-                            "encontradas."
+                            "🔎 Enviando as 5 melhores."
                         )
 
-                        for i, oportunidade in enumerate(
+                        for i, op in enumerate(
                             melhores,
                             start=1
                         ):
@@ -1919,7 +2196,7 @@ def rotina_diaria():
                                 CHAT_ID,
 
                                 formatar_oportunidade(
-                                    oportunidade,
+                                    op,
                                     i,
                                     abaixo_do_filtro=True
                                 )
@@ -1971,7 +2248,7 @@ def iniciar_servidor():
 
 
 # =========================================================
-# INICIAR BOT
+# INICIAR
 # =========================================================
 
 if __name__ == "__main__":
