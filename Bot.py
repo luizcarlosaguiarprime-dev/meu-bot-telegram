@@ -445,27 +445,22 @@ def buscar_jogos_do_dia():
                             jogo_id
                         ]["markets"]:
 
-                            jogos[
-                                jogo_id
-                            ]["markets"][chave] = []
+                jogos[
+    jogo_id
+]["markets"][chave].append({
 
-                        jogos[
-                            jogo_id
-                        ]["markets"][chave].append({
+    "bookmaker":
+        bookmaker.get(
+            "title",
+            "Casa"
+        ),
 
-                            "bookmaker":
-                                bookmaker.get(
-                                    "title",
-                                    "Casa"
-                                ),
-
-                            "outcomes":
-                                market.get(
-                                    "outcomes",
-                                    []
-                                )
-
-                        }
+    "outcomes":
+        market.get(
+            "outcomes",
+            []
+        )
+})
 
     return list(
         jogos.values()
