@@ -125,6 +125,30 @@ def formatar_data_hora(utc_time):
 
 
 # ============================================================
+# PERÍODO DA ANÁLISE
+# ============================================================
+
+def periodo_analisado():
+
+    agora = agora_brasilia()
+
+    # Sempre analisar o DIA SEGUINTE
+    inicio = (
+        agora.replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0
+        )
+        + timedelta(days=1)
+    )
+
+    fim = inicio + timedelta(days=1)
+
+    return inicio, fim
+
+
+# ============================================================
 # NOME DOS MERCADOS
 # ============================================================
 
@@ -198,23 +222,25 @@ def buscar_odds(esporte, mercado):
 
 
 # ============================================================
-# BUSCAR TODOS OS JOGOS DE HOJE
+# BUSCAR JOGOS DO DIA SEGUINTE
 # ============================================================
 
 def buscar_jogos_do_dia():
 
     jogos = {}
 
-    agora = agora_brasilia()
+    inicio, fim = periodo_analisado()
 
-    inicio = agora.replace(
-        hour=0,
-        minute=0,
-        second=0,
-        microsecond=0
+    print(
+        "📅 Período analisado:"
     )
 
-    fim = inicio + timedelta(days=1)
+    print(
+        inicio.strftime("%d/%m/%Y %H:%M")
+        + " até "
+        + fim.strftime("%d/%m/%Y %H:%M")
+        + " Brasília"
+    )
 
     for esporte in ESPORTES:
 
@@ -239,6 +265,7 @@ def buscar_jogos_do_dia():
                 if not horario:
                     continue
 
+                # Somente jogos do DIA SEGUINTE
                 if not (
                     inicio <= horario < fim
                 ):
@@ -316,8 +343,7 @@ def buscar_jogos_do_dia():
 
 
 # ============================================================
-# PROBABILIDADE DE CADA CASA
-# REMOVE A MARGEM (OVERROUND)
+# PROBABILIDADES SEM MARGEM
 # ============================================================
 
 def probabilidades_sem_margem(outcomes):
@@ -333,10 +359,13 @@ def probabilidades_sem_margem(outcomes):
         if not odd or odd <= 1:
             continue
 
-        inversa = 1 / odd
+        nome = outcome.get("name")
+
+        if not nome:
+            continue
 
         inversas.append(
-            (outcome.get("name"), inversa)
+            (nome, 1 / odd)
         )
 
     soma = sum(
@@ -357,14 +386,14 @@ def probabilidades_sem_margem(outcomes):
 
 
 # ============================================================
-# CONSENSO DO MERCADO
+# CONSENSO
 # ============================================================
 
-def calcular_consenso(mercados):
+def calcular_consenso(casas):
 
     dados = {}
 
-    for casa in mercados:
+    for casa in casas:
 
         probabilidades = (
             probabilidades_sem_margem(
@@ -386,7 +415,8 @@ def calcular_consenso(mercados):
 
     for nome, valores in dados.items():
 
-        # Exige pelo menos 2 casas
+        # Pelo menos 2 casas precisam
+        # concordar com o mercado
         if len(valores) < 2:
             continue
 
@@ -398,14 +428,14 @@ def calcular_consenso(mercados):
 
 
 # ============================================================
-# ENCONTRAR A MELHOR ODD
+# MELHOR ODD DISPONÍVEL
 # ============================================================
 
-def melhor_odd(mercados, selecao):
+def melhor_odd(casas, selecao):
 
     melhor = None
 
-    for casa in mercados:
+    for casa in casas:
 
         for outcome in casa["outcomes"]:
 
@@ -417,11 +447,17 @@ def melhor_odd(mercados, selecao):
             if not odd or odd <= 1:
                 continue
 
-            if melhor is None or odd > melhor["odd"]:
+            if (
+                melhor is None
+                or odd > melhor["odd"]
+            ):
 
                 melhor = {
-                    "casa": casa["bookmaker"],
-                    "odd": odd
+                    "casa":
+                        casa["bookmaker"],
+
+                    "odd":
+                        odd
                 }
 
     return melhor
@@ -435,7 +471,9 @@ def analisar_jogo(jogo):
 
     oportunidades = []
 
-    for mercado, casas in jogo["markets"].items():
+    for mercado, casas in jogo[
+        "markets"
+    ].items():
 
         if not casas:
             continue
@@ -448,9 +486,6 @@ def analisar_jogo(jogo):
             continue
 
         for selecao, probabilidade in consenso.items():
-
-            if probabilidade <= 0:
-                continue
 
             melhor = melhor_odd(
                 casas,
@@ -499,20 +534,15 @@ def analisar_jogo(jogo):
 
 
 # ============================================================
-# ANALISAR O DIA
+# ANALISAR TODAS AS PARTIDAS
 # ============================================================
 
 def analisar_oportunidades():
 
-    print(
-        "🔎 ANALISANDO OPORTUNIDADES DO DIA..."
-    )
-
     jogos = buscar_jogos_do_dia()
 
     print(
-        f"⚽ Total de jogos encontrados: "
-        f"{len(jogos)}"
+        f"⚽ Jogos do período: {len(jogos)}"
     )
 
     todas = []
@@ -532,7 +562,6 @@ def analisar_oportunidades():
         reverse=True
     )
 
-    # Remove duplicidades
     resultado = []
 
     usadas = set()
@@ -556,12 +585,11 @@ def analisar_oportunidades():
             oportunidade
         )
 
-    # Até 20 oportunidades
     return resultado[:20]
 
 
 # ============================================================
-# FORMATAR MENSAGEM
+# FORMATAR OPORTUNIDADE
 # ============================================================
 
 def formatar_oportunidade(o):
@@ -610,13 +638,13 @@ def formatar_oportunidade(o):
         f"📈 <b>EV:</b> "
         f"+{o['ev']:.2f}%\n\n"
 
-        "⚠️ EV baseado no consenso "
-        "das odds disponíveis."
+        "⚠️ EV calculado com base "
+        "no consenso das odds disponíveis."
     )
 
 
 # ============================================================
-# ENVIO DA ANÁLISE
+# ENVIO AUTOMÁTICO
 # ============================================================
 
 def enviar_analise_diaria():
@@ -626,7 +654,8 @@ def enviar_analise_diaria():
     if CHAT_ID is None:
 
         print(
-            "⚠️ CHAT_ID ainda não configurado."
+            "⚠️ CHAT_ID não configurado. "
+            "Envie /start."
         )
 
         return
@@ -635,24 +664,29 @@ def enviar_analise_diaria():
 
     if ULTIMO_ENVIO == hoje:
 
-        print(
-            "ℹ️ Análise de hoje já enviada."
-        )
-
         return
 
     oportunidades = analisar_oportunidades()
+
+    inicio, fim = periodo_analisado()
+
+    data_analisada = inicio.strftime(
+        "%d/%m/%Y"
+    )
 
     if not oportunidades:
 
         bot.send_message(
             CHAT_ID,
             "📊 <b>ANÁLISE DIÁRIA</b>\n\n"
-            "Hoje não encontrei oportunidades "
-            f"com EV de pelo menos {EV_MINIMO:.0f}% "
-            "nas principais competições analisadas.\n\n"
-            "⚽ Foram considerados os jogos "
-            "de hoje disponíveis na API.",
+
+            f"📅 Jogos analisados: "
+            f"<b>{data_analisada}</b>\n\n"
+
+            f"❌ Não encontrei oportunidades "
+            f"com EV de pelo menos "
+            f"{EV_MINIMO:.0f}% nas principais "
+            "competições disponíveis.",
             parse_mode="HTML"
         )
 
@@ -663,13 +697,18 @@ def enviar_analise_diaria():
     bot.send_message(
         CHAT_ID,
         "📊 <b>ANÁLISE DIÁRIA — EV+</b>\n\n"
-        "🕘 Análise realizada às 09:00 "
-        "(horário de Brasília)\n"
-        "⚽ Jogos de todo o dia\n"
+
+        f"📅 <b>Data analisada:</b> "
+        f"{data_analisada}\n"
+
+        "🕘 Análise realizada às "
+        "<b>09:00 Brasília</b>\n"
+
         "🏆 Principais ligas nacionais "
         "e continentais\n\n"
+
         f"🔥 <b>{len(oportunidades)}</b> "
-        "oportunidades encontradas:",
+        "principais oportunidades:",
         parse_mode="HTML"
     )
 
@@ -690,25 +729,25 @@ def enviar_analise_diaria():
         except Exception as e:
 
             print(
-                f"❌ Erro enviando mensagem: {e}"
+                f"❌ Erro enviando: {e}"
             )
 
     ULTIMO_ENVIO = hoje
 
     print(
-        "✅ ANÁLISE DIÁRIA ENVIADA."
+        "✅ Análise diária enviada."
     )
 
 
 # ============================================================
-# AGENDAMENTO — 09:00 BRASÍLIA
+# AGENDADOR
 # ============================================================
 
 def verificar_horario():
 
     print(
-        "⏰ Agendamento configurado para "
-        "09:00 Brasília."
+        "⏰ Análise automática: "
+        "todos os dias às 09:00 Brasília."
     )
 
     while True:
@@ -748,15 +787,21 @@ def start(message):
     bot.reply_to(
         message,
         "✅ <b>BOT ATIVADO!</b>\n\n"
-        "🕘 Vou fazer apenas <b>1 análise "
-        "por dia</b>.\n\n"
-        "⏰ Horário: <b>09:00 Brasília</b>\n"
-        "⚽ Jogos de todo o dia\n"
+
+        "🕘 Análise automática: "
+        "<b>09:00 Brasília</b>\n\n"
+
+        "📅 Vou analisar os jogos "
+        "do <b>dia seguinte inteiro</b>.\n\n"
+
         "🏆 Principais ligas nacionais "
         "e continentais\n"
-        "🔥 Somente oportunidades EV+\n\n"
-        "📊 Use /odds se quiser fazer "
-        "uma análise manual agora.",
+
+        "🔥 Apenas oportunidades "
+        "com EV+ de pelo menos 3%.\n\n"
+
+        "📊 Use /odds para testar "
+        "a análise agora.",
         parse_mode="HTML"
     )
 
@@ -773,8 +818,9 @@ def odds(message):
     bot.send_message(
         message.chat.id,
         "🔎 <b>ANÁLISE MANUAL</b>\n\n"
-        "Vou analisar os jogos de hoje "
-        "nas principais competições...",
+        "Analisando o dia seguinte "
+        "completo nas principais "
+        "competições...",
         parse_mode="HTML"
     )
 
@@ -782,18 +828,27 @@ def odds(message):
 
     if not oportunidades:
 
+        inicio, fim = periodo_analisado()
+
+        data = inicio.strftime(
+            "%d/%m/%Y"
+        )
+
         bot.send_message(
             message.chat.id,
             "❌ Não encontrei oportunidades "
-            f"com EV de pelo menos {EV_MINIMO:.0f}% "
-            "nos jogos disponíveis hoje."
+            f"com EV de pelo menos "
+            f"{EV_MINIMO:.0f}% para "
+            f"<b>{data}</b>.",
+            parse_mode="HTML"
         )
 
         return
 
     bot.send_message(
         message.chat.id,
-        f"🔥 Encontrei <b>{len(oportunidades)}</b> "
+        f"🔥 Encontrei "
+        f"<b>{len(oportunidades)}</b> "
         "oportunidades EV+.",
         parse_mode="HTML"
     )
@@ -827,7 +882,8 @@ def qualquer_mensagem(message):
     bot.reply_to(
         message,
         "Use /start para ativar o bot "
-        "ou /odds para analisar agora."
+        "ou /odds para analisar o "
+        "dia seguinte."
     )
 
 
@@ -852,7 +908,7 @@ if __name__ == "__main__":
     ).start()
 
     print(
-        "🤖 Telegram conectado."
+        "🤖 Bot Telegram conectado."
     )
 
     bot.infinity_polling()
