@@ -1,2269 +1,1437 @@
+
 import os
-import math
 import time
+import math
 import threading
-import statistics
-import requests
-
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+from collections import defaultdict
 
+import requests
 import telebot
 from flask import Flask
 
-
-# =========================================================
-# CONFIGURAÇÕES
-# =========================================================
+# ============================================================
+# BOT DE MONITORAMENTO LIVE - FUTEBOL
+# ============================================================
+# Fonte principal: API-Football / API-Sports
+#
+# Variáveis no Render:
+#   BOT_TOKEN=token do Telegram
+#   APIFOOTBALL_KEY=chave da API-Football
+#
+# Opcional:
+#   LIVE_INTERVAL=60
+#   HISTORY_MATCHES=15
+#   ALERT_COOLDOWN=15
+#
+# O bot NÃO faz apostas. Ele monitora jogos e envia sinais
+# estatísticos para análise manual.
+# ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ODDS_API_KEY = os.getenv("ODDS_API_KEY")
-FOOTBALL_DATA_TOKEN = os.getenv("FOOTBALL_DATA_TOKEN", "").strip()
+API_KEY = os.getenv("APIFOOTBALL_KEY")
 
-BANCA = 1000.00
+LIVE_INTERVAL = max(30, int(os.getenv("LIVE_INTERVAL", "60")))
+HISTORY_MATCHES = max(5, min(20, int(os.getenv("HISTORY_MATCHES", "15"))))
+ALERT_COOLDOWN = max(5, int(os.getenv("ALERT_COOLDOWN", "15")))
 
-# Kelly fracionado
-KELLY_FRACAO = 0.25
+TZ = ZoneInfo("America/Sao_Paulo")
+API_BASE = "https://v3.football.api-sports.io"
 
-# Filtro principal
-EV_MINIMO = 5.0
-EV_MAXIMO = 20.0
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN não configurado.")
 
-# Número mínimo de casas
-MINIMO_CASAS = 3
+if not API_KEY:
+    raise RuntimeError(
+        "APIFOOTBALL_KEY não configurada. "
+        "Crie uma chave na API-Football e adicione no Render."
+    )
 
-# Diferença mínima entre modelo e mercado
-# para considerar o modelo relevante
-DIFERENCA_MODELO_MINIMA = 0.025
-
-# Peso do modelo
-PESO_MODELO = 0.60
-
-# Peso do mercado
-PESO_MERCADO = 0.40
-
-TIMEZONE = ZoneInfo("America/Sao_Paulo")
-
-ODDS_URL = "https://api.the-odds-api.com/v4/sports/{}/odds"
-
-FOOTBALL_DATA_URL = "https://api.football-data.org/v4"
-
-
-# =========================================================
-# FLASK / TELEGRAM
-# =========================================================
-
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 app = Flask(__name__)
 
-bot = telebot.TeleBot(BOT_TOKEN)
-
 CHAT_ID = None
+MONITORANDO = True
+
+# Cache para reduzir chamadas à API
+CACHE = {}
+CACHE_TTL = 45
+
+# Histórico já calculado
+HIST_CACHE = {}
+
+# Último alerta por jogo/tipo
+LAST_ALERT = {}
+
+# Evita recalcular o mesmo jogo simultaneamente
+PROCESSANDO = set()
+
+# IDs das competições prioritárias.
+# A temporada é determinada automaticamente pela configuração abaixo.
+LEAGUES = {
+    # Campeonatos
+    71: "Brasileirão Série A",
+    39: "Premier League",
+    140: "La Liga",
+    78: "Bundesliga",
+    135: "Serie A",
+    61: "Ligue 1",
+    94: "Primeira Liga",
+
+    # Copas nacionais
+    72: "Copa do Brasil",
+    45: "FA Cup",
+    143: "Copa del Rey",
+    81: "DFB Pokal",
+    137: "Coppa Italia",
+    66: "Coupe de France",
+    96: "Taça de Portugal",
+
+    # Europa / América do Sul
+    2: "Champions League",
+    3: "Europa League",
+    848: "Conference League",
+    13: "Libertadores",
+    11: "Sudamericana",
+}
+
+# Estados considerados ao vivo
+LIVE_STATUSES = {
+    "1H", "HT", "2H", "ET", "BT", "P", "LIVE"
+}
 
 
-# =========================================================
-# CACHE
-# =========================================================
+# ============================================================
+# UTILITÁRIOS
+# ============================================================
 
-CACHE_FORMA = {}
-
-CACHE_IDS = None
-
-
-# =========================================================
-# COMPETIÇÕES
-# =========================================================
-
-COMPETICOES = [
-    "soccer_epl",
-    "soccer_spain_la_liga",
-    "soccer_italy_serie_a",
-    "soccer_germany_bundesliga",
-    "soccer_france_ligue_one",
-    "soccer_brazil_campeonato",
-    "soccer_uefa_champs_league",
-    "soccer_uefa_europa_league",
-    "soccer_uefa_europa_conference_league",
-    "soccer_conmebol_libertadores",
-    "soccer_conmebol_sudamericana",
-]
+def agora():
+    return datetime.now(TZ)
 
 
-MERCADOS = [
-    "h2h",
-    "totals",
-    "btts"
-]
+def safe_float(v, default=0.0):
+    try:
+        if v is None:
+            return default
+        return float(v)
+    except Exception:
+        return default
 
 
-# =========================================================
-# DATA / NOMES
-# =========================================================
-
-def agora_brasilia():
-    return datetime.now(TIMEZONE)
+def safe_int(v, default=0):
+    try:
+        if v is None:
+            return default
+        return int(v)
+    except Exception:
+        return default
 
 
 def normalizar_nome(nome):
-
     if not nome:
         return ""
-
-    nome = nome.lower().strip()
-
-    substituicoes = [
-        (" fc ", " "),
-        (" fc", ""),
-        ("fc ", ""),
-        (" cf ", " "),
-        (" cf", ""),
-        (" afc ", " "),
-        (" afc", ""),
-        (" sc ", " "),
-        (" sc", ""),
-        (" fk ", " "),
-        (" fk", ""),
-        ("  ", " "),
-    ]
-
-    nome = f" {nome} "
-
-    for antigo, novo in substituicoes:
-        nome = nome.replace(
-            antigo,
-            novo
-        )
-
-    return nome.strip()
-
-
-# =========================================================
-# POISSON
-# =========================================================
-
-def poisson(k, lamb):
-
-    if lamb <= 0:
-        return 0.0
-
     return (
-        math.exp(-lamb)
-        * (lamb ** k)
-        / math.factorial(k)
+        nome.lower()
+        .replace(".", "")
+        .replace("-", " ")
+        .replace("_", " ")
+        .strip()
     )
 
 
-# =========================================================
-# ODDS API
-# =========================================================
+def cache_get(key):
+    item = CACHE.get(key)
+    if not item:
+        return None
 
-def buscar_odds(esporte, mercado):
+    timestamp, value = item
+    if time.time() - timestamp > CACHE_TTL:
+        CACHE.pop(key, None)
+        return None
 
-    if not ODDS_API_KEY:
-        return []
+    return value
+
+
+def cache_set(key, value, ttl=None):
+    CACHE[key] = (time.time(), value)
+
+
+def api_get(endpoint, params=None, ttl=CACHE_TTL):
+    key = endpoint + "|" + str(sorted((params or {}).items()))
+    cached = cache_get(key)
+
+    if cached is not None:
+        return cached
+
+    headers = {
+        "x-apisports-key": API_KEY
+    }
+
+    url = API_BASE + endpoint
 
     try:
-
-        params = {
-            "apiKey": ODDS_API_KEY,
-            "regions": "eu",
-            "markets": mercado,
-            "oddsFormat": "decimal",
-        }
-
-        resposta = requests.get(
-            ODDS_URL.format(esporte),
-            params=params,
-            timeout=25
+        r = requests.get(
+            url,
+            headers=headers,
+            params=params or {},
+            timeout=20
         )
 
-        if resposta.status_code != 200:
-            return []
+        if r.status_code == 429:
+            print("API-Football: limite de requisições atingido.")
+            return None
 
-        dados = resposta.json()
+        if r.status_code != 200:
+            print("API-Football erro:", r.status_code, r.text[:300])
+            return None
 
-        if not isinstance(dados, list):
-            return []
+        data = r.json()
 
-        return dados
+        if data.get("errors"):
+            print("API-Football errors:", data["errors"])
+            return None
 
-    except Exception:
+        response = data.get("response", [])
+        cache_set(key, response)
+
+        return response
+
+    except Exception as e:
+        print("Erro API:", e)
+        return None
+
+
+def percentual(valor):
+    return f"{valor:.0f}%"
+
+
+def barra(valor, tamanho=10):
+    valor = max(0, min(100, valor))
+    cheios = round(valor / 100 * tamanho)
+    return "█" * cheios + "░" * (tamanho - cheios)
+
+
+# ============================================================
+# TEMPORADA
+# ============================================================
+
+def temporada_atual():
+    # API-Football normalmente identifica a temporada pelo ano
+    # em que a competição começou.
+    # Para ligas europeias em setembro, 2026 = temporada 2026.
+    # Para Brasileirão, também usamos 2026.
+    return agora().year
+
+
+# ============================================================
+# JOGOS AO VIVO
+# ============================================================
+
+def obter_jogos_ao_vivo():
+    """
+    Retorna todos os jogos live disponíveis na API.
+    Depois filtramos pelas ligas configuradas.
+    """
+    dados = api_get("/fixtures", {"live": "all"}, ttl=30)
+
+    if not dados:
         return []
 
+    jogos = []
 
-# =========================================================
-# PROBABILIDADE SEM MARGEM
-# =========================================================
+    for item in dados:
+        fixture = item.get("fixture", {})
+        league = item.get("league", {})
+        teams = item.get("teams", {})
+        goals = item.get("goals", {})
+        status = fixture.get("status", {})
 
-def probabilidades_mercado(resultados):
+        league_id = league.get("id")
 
-    if not resultados:
-        return {}
-
-    probabilidades = {}
-
-    for resultado, odd in resultados.items():
-
-        try:
-
-            odd = float(odd)
-
-            if odd <= 1:
-                continue
-
-            probabilidades[resultado] = 1.0 / odd
-
-        except Exception:
+        if league_id not in LEAGUES:
             continue
 
-    soma = sum(
-        probabilidades.values()
+        status_short = status.get("short")
+
+        if status_short not in LIVE_STATUSES:
+            continue
+
+        jogos.append({
+            "id": fixture.get("id"),
+            "timestamp": fixture.get("timestamp"),
+            "minute": safe_int(status.get("elapsed")),
+            "status": status_short,
+            "league_id": league_id,
+            "league": LEAGUES.get(league_id, league.get("name", "")),
+            "home_id": teams.get("home", {}).get("id"),
+            "away_id": teams.get("away", {}).get("id"),
+            "home": teams.get("home", {}).get("name", "Casa"),
+            "away": teams.get("away", {}).get("name", "Fora"),
+            "home_goals": safe_int(goals.get("home")),
+            "away_goals": safe_int(goals.get("away")),
+        })
+
+    return jogos
+
+
+# ============================================================
+# ESTATÍSTICAS LIVE
+# ============================================================
+
+def obter_estatisticas_live(fixture_id):
+    dados = api_get(
+        "/fixtures/statistics",
+        {"fixture": fixture_id},
+        ttl=35
     )
 
-    if soma <= 0:
+    if not dados:
         return {}
 
-    for resultado in probabilidades:
-
-        probabilidades[resultado] /= soma
-
-    return probabilidades
-
-
-# =========================================================
-# CONSENSO DAS CASAS
-# =========================================================
-
-def coletar_consenso(jogo, mercado):
-
-    selecoes = {}
-
-    for bookmaker in jogo.get(
-        "bookmakers",
-        []
-    ):
-
-        nome_casa = bookmaker.get(
-            "title",
-            "Casa"
-        )
-
-        for market in bookmaker.get(
-            "markets",
-            []
-        ):
-
-            if market.get("key") != mercado:
-                continue
-
-            outcomes = market.get(
-                "outcomes",
-                []
-            )
-
-            # =================================================
-            # H2H / BTTS
-            # =================================================
-
-            if mercado in [
-                "h2h",
-                "btts"
-            ]:
-
-                odds = {}
-
-                for outcome in outcomes:
-
-                    nome = outcome.get(
-                        "name"
-                    )
-
-                    odd = outcome.get(
-                        "price"
-                    )
-
-                    if nome and odd:
-
-                        try:
-                            odds[nome] = float(
-                                odd
-                            )
-                        except Exception:
-                            pass
-
-                probs = probabilidades_mercado(
-                    odds
-                )
-
-                if not probs:
-                    continue
-
-                for selecao, prob in probs.items():
-
-                    if selecao not in selecoes:
-
-                        selecoes[selecao] = {
-                            "probabilidades": [],
-                            "odds": [],
-                            "casas": set()
-                        }
-
-                    selecoes[
-                        selecao
-                    ][
-                        "probabilidades"
-                    ].append(prob)
-
-                    if selecao in odds:
-
-                        selecoes[
-                            selecao
-                        ][
-                            "odds"
-                        ].append(
-                            (
-                                odds[selecao],
-                                nome_casa
-                            )
-                        )
-
-                        selecoes[
-                            selecao
-                        ][
-                            "casas"
-                        ].add(
-                            nome_casa
-                        )
-
-            # =================================================
-            # TOTALS
-            # =================================================
-
-            elif mercado == "totals":
-
-                grupos = {}
-
-                for outcome in outcomes:
-
-                    nome = outcome.get(
-                        "name"
-                    )
-
-                    ponto = outcome.get(
-                        "point"
-                    )
-
-                    odd = outcome.get(
-                        "price"
-                    )
-
-                    if (
-                        nome is None
-                        or ponto is None
-                        or odd is None
-                    ):
-                        continue
-
-                    try:
-
-                        ponto = float(ponto)
-                        odd = float(odd)
-
-                    except Exception:
-                        continue
-
-                    chave = (
-                        f"{nome}_{ponto}"
-                    )
-
-                    if chave not in grupos:
-                        grupos[chave] = {}
-
-                    grupos[chave][nome] = odd
-
-                for chave, odds in grupos.items():
-
-                    probs = probabilidades_mercado(
-                        odds
-                    )
-
-                    if not probs:
-                        continue
-
-                    try:
-
-                        ponto = float(
-                            chave.rsplit(
-                                "_",
-                                1
-                            )[1]
-                        )
-
-                    except Exception:
-                        continue
-
-                    for selecao, prob in probs.items():
-
-                        chave_selecao = (
-                            f"{selecao}_{ponto}"
-                        )
-
-                        if (
-                            chave_selecao
-                            not in selecoes
-                        ):
-
-                            selecoes[
-                                chave_selecao
-                            ] = {
-                                "selecao": selecao,
-                                "point": ponto,
-                                "probabilidades": [],
-                                "odds": [],
-                                "casas": set()
-                            }
-
-                        selecoes[
-                            chave_selecao
-                        ][
-                            "probabilidades"
-                        ].append(prob)
-
-                        if selecao in odds:
-
-                            selecoes[
-                                chave_selecao
-                            ][
-                                "odds"
-                            ].append(
-                                (
-                                    odds[selecao],
-                                    nome_casa
-                                )
-                            )
-
-                            selecoes[
-                                chave_selecao
-                            ][
-                                "casas"
-                            ].add(
-                                nome_casa
-                            )
-
-    # =====================================================
-    # TRANSFORMAR EM CONSENSO FINAL
-    # =====================================================
-
-    resultado = {}
-
-    for chave, dados in selecoes.items():
-
-        probabilidades = dados.get(
-            "probabilidades",
-            []
-        )
-
-        casas = dados.get(
-            "casas",
-            set()
-        )
-
-        odds = dados.get(
-            "odds",
-            []
-        )
-
-        if not probabilidades:
-            continue
-
-        if len(casas) < MINIMO_CASAS:
-            continue
-
-        if not odds:
-            continue
-
-        # Mediana é mais resistente
-        # a uma casa discrepante.
-        probabilidade = statistics.median(
-            probabilidades
-        )
-
-        # Melhor odd disponível
-        melhor_odd, melhor_casa = max(
-            odds,
-            key=lambda x: x[0]
-        )
-
-        dispersao = (
-            max(probabilidades)
-            - min(probabilidades)
-        )
-
-        resultado[chave] = {
-
-            "selecao": dados.get(
-                "selecao",
-                chave
-            ),
-
-            "point": dados.get(
-                "point"
-            ),
-
-            "probabilidade": probabilidade,
-
-            "odd": melhor_odd,
-
-            "casa": melhor_casa,
-
-            "casas": len(casas),
-
-            "dispersao": dispersao,
-
-            "lista_casas": sorted(
-                casas
-            )
-        }
+    resultado = {
+        "home": {},
+        "away": {}
+    }
+
+    for team_block in dados:
+        team_id = team_block.get("team", {}).get("id")
+        stats = {}
+
+        for s in team_block.get("statistics", []):
+            tipo = s.get("type")
+            valor = s.get("value")
+            stats[tipo] = valor
+
+        # A API retorna os dois times; o primeiro bloco não deve ser
+        # presumido como casa, por isso identificamos pelo ID depois.
+        resultado.setdefault("raw", []).append({
+            "team_id": team_id,
+            "stats": stats
+        })
 
     return resultado
 
 
-# =========================================================
-# FOOTBALL-DATA.ORG
-# =========================================================
+def parse_stat_number(valor):
+    if valor is None:
+        return 0.0
 
-def football_data_request(endpoint):
+    if isinstance(valor, (int, float)):
+        return float(valor)
 
-    if not FOOTBALL_DATA_TOKEN:
-        return None
+    texto = str(valor).strip()
+
+    if "%" in texto:
+        try:
+            return float(texto.replace("%", "").strip())
+        except Exception:
+            return 0.0
+
+    # Exemplos: "5", "5/8"
+    if "/" in texto:
+        try:
+            return float(texto.split("/")[0])
+        except Exception:
+            return 0.0
 
     try:
-
-        headers = {
-            "X-Auth-Token":
-                FOOTBALL_DATA_TOKEN
-        }
-
-        resposta = requests.get(
-            FOOTBALL_DATA_URL + endpoint,
-            headers=headers,
-            timeout=20
-        )
-
-        if resposta.status_code != 200:
-            return None
-
-        return resposta.json()
-
+        return float(texto)
     except Exception:
-        return None
+        return 0.0
 
 
-# =========================================================
-# BUSCAR IDS DAS EQUIPES
-# =========================================================
+def organizar_stats_live(raw, home_id, away_id):
+    resultado = {
+        "home": defaultdict(float),
+        "away": defaultdict(float)
+    }
 
-def buscar_ids_equipes():
+    for bloco in raw.get("raw", []):
+        team_id = bloco.get("team_id")
+        stats = bloco.get("stats", {})
 
-    global CACHE_IDS
+        lado = None
 
-    if CACHE_IDS is not None:
-        return CACHE_IDS
+        if team_id == home_id:
+            lado = "home"
+        elif team_id == away_id:
+            lado = "away"
 
-    if not FOOTBALL_DATA_TOKEN:
-        CACHE_IDS = {}
-        return CACHE_IDS
-
-    ids = {}
-
-    competicoes = [
-        "BSA",
-        "PL",
-        "BL1",
-        "SA",
-        "FL1",
-        "PD"
-    ]
-
-    for codigo in competicoes:
-
-        dados = football_data_request(
-            f"/competitions/{codigo}/teams"
-        )
-
-        if not dados:
+        if not lado:
             continue
 
-        for equipe in dados.get(
-            "teams",
-            []
-        ):
+        for chave, valor in stats.items():
+            resultado[lado][chave] = parse_stat_number(valor)
 
-            nome = equipe.get(
-                "name"
-            )
-
-            team_id = equipe.get(
-                "id"
-            )
-
-            if nome and team_id:
-
-                ids[
-                    normalizar_nome(nome)
-                ] = team_id
-
-    CACHE_IDS = ids
-
-    return CACHE_IDS
+    return resultado
 
 
-# =========================================================
-# HISTÓRICO DA EQUIPE
-# =========================================================
+def stat(stats, nome, lado):
+    return safe_float(stats.get(lado, {}).get(nome), 0)
 
-def obter_jogos_equipe(
-    team_id,
-    quantidade=10
-):
 
-    data_final = agora_brasilia().date()
+# ============================================================
+# HISTÓRICO DAS EQUIPES
+# ============================================================
 
-    data_inicial = (
-        data_final
-        - timedelta(days=150)
-    )
+def obter_historico_time(team_id):
+    """
+    Busca os últimos jogos da equipe.
+    Não fica preso somente ao campeonato atual:
+    pega a sequência recente geral, permitindo cruzar
+    desempenho de diferentes competições.
+    """
+    cache_key = f"history:{team_id}:{HISTORY_MATCHES}"
 
-    endpoint = (
-        f"/teams/{team_id}/matches"
-        f"?dateFrom={data_inicial}"
-        f"&dateTo={data_final}"
-        f"&status=FINISHED"
-    )
+    if cache_key in HIST_CACHE:
+        timestamp, value = HIST_CACHE[cache_key]
 
-    dados = football_data_request(
-        endpoint
+        # Histórico dura mais tempo que estatísticas live
+        if time.time() - timestamp < 900:
+            return value
+
+    dados = api_get(
+        "/fixtures",
+        {
+            "team": team_id,
+            "last": HISTORY_MATCHES
+        },
+        ttl=600
     )
 
     if not dados:
         return []
 
-    jogos = dados.get(
-        "matches",
-        []
-    )
+    historico = []
 
-    jogos = sorted(
-        jogos,
-        key=lambda x: x.get(
-            "utcDate",
-            ""
-        ),
-        reverse=True
-    )
+    for jogo in dados:
+        fixture = jogo.get("fixture", {})
+        teams = jogo.get("teams", {})
+        goals = jogo.get("goals", {})
+        league = jogo.get("league", {})
 
-    return jogos[:quantidade]
+        home = teams.get("home", {})
+        away = teams.get("away", {})
 
+        eh_casa = home.get("id") == team_id
 
-# =========================================================
-# FORMA DA EQUIPE
-# =========================================================
-
-def calcular_forma_equipe(
-    team_id
-):
-
-    if team_id in CACHE_FORMA:
-
-        return CACHE_FORMA[
-            team_id
-        ]
-
-    jogos = obter_jogos_equipe(
-        team_id,
-        10
-    )
-
-    if not jogos:
-
-        CACHE_FORMA[
-            team_id
-        ] = None
-
-        return None
-
-    gols_marcados = []
-    gols_sofridos = []
-
-    casa_marcados = []
-    casa_sofridos = []
-
-    fora_marcados = []
-    fora_sofridos = []
-
-    resultados = []
-
-    for jogo in jogos:
-
-        home = jogo.get(
-            "homeTeam",
-            {}
+        gols_pro = (
+            safe_int(goals.get("home"))
+            if eh_casa
+            else safe_int(goals.get("away"))
         )
 
-        away = jogo.get(
-            "awayTeam",
-            {}
+        gols_contra = (
+            safe_int(goals.get("away"))
+            if eh_casa
+            else safe_int(goals.get("home"))
         )
 
-        score = jogo.get(
-            "score",
-            {}
-        ).get(
-            "fullTime",
-            {}
-        )
+        vencedor = jogo.get("teams", {}).get("home", {}).get("winner")
 
-        hg = score.get("home")
-        ag = score.get("away")
+        if vencedor is True:
+            resultado = "V" if eh_casa else "D"
+        elif vencedor is False:
+            resultado = "D" if eh_casa else "V"
+        else:
+            resultado = "E"
 
-        if hg is None or ag is None:
+        historico.append({
+            "fixture_id": fixture.get("id"),
+            "date": fixture.get("date"),
+            "league_id": league.get("id"),
+            "league": league.get("name", ""),
+            "home": home.get("name", ""),
+            "away": away.get("name", ""),
+            "casa": eh_casa,
+            "gols_pro": gols_pro,
+            "gols_contra": gols_contra,
+            "resultado": resultado,
+        })
+
+    HIST_CACHE[cache_key] = (time.time(), historico)
+    return historico
+
+
+def obter_stats_historico_fixture(fixture_id):
+    """
+    Estatísticas de uma partida histórica.
+    É chamada apenas para um conjunto limitado de partidas,
+    evitando excesso de requisições.
+    """
+    cache_key = f"oldstats:{fixture_id}"
+
+    if cache_key in CACHE:
+        timestamp, value = CACHE[cache_key]
+        if time.time() - timestamp < 3600:
+            return value
+
+    dados = api_get(
+        "/fixtures/statistics",
+        {"fixture": fixture_id},
+        ttl=3600
+    )
+
+    if not dados:
+        return {}
+
+    saida = []
+
+    for bloco in dados:
+        team_id = bloco.get("team", {}).get("id")
+        stats = {}
+
+        for s in bloco.get("statistics", []):
+            stats[s.get("type")] = parse_stat_number(s.get("value"))
+
+        saida.append({
+            "team_id": team_id,
+            "stats": stats
+        })
+
+    cache_set(cache_key, saida)
+    return saida
+
+
+# ============================================================
+# MODELO HISTÓRICO
+# ============================================================
+
+def media_ponderada(valores):
+    if not valores:
+        return 0.0
+
+    # Dá mais peso aos jogos mais recentes.
+    # valores devem estar do mais recente para o mais antigo.
+    pesos = list(range(len(valores), 0, -1))
+
+    numerador = sum(v * p for v, p in zip(valores, pesos))
+    denominador = sum(pesos)
+
+    return numerador / denominador
+
+
+def calcular_forma(team_id):
+    historico = obter_historico_time(team_id)
+
+    if not historico:
+        return {
+            "jogos": 0,
+            "vitorias": 0,
+            "empates": 0,
+            "derrotas": 0,
+            "pontos": 0,
+            "gols_pro": 0,
+            "gols_contra": 0,
+            "media_gols_pro": 0,
+            "media_gols_contra": 0,
+            "casa_media_gols": 0,
+            "fora_media_gols": 0,
+            "escanteios_pro": 0,
+            "escanteios_contra": 0,
+            "finalizacoes": 0,
+            "finalizacoes_alvo": 0,
+            "ataques_perigosos": 0,
+            "recuperacoes": 0,
+            "amostra_stats": 0,
+        }
+
+    # Mantemos todos os jogos para gols/resultados.
+    vitorias = sum(x["resultado"] == "V" for x in historico)
+    empates = sum(x["resultado"] == "E" for x in historico)
+    derrotas = sum(x["resultado"] == "D" for x in historico)
+
+    pontos = vitorias * 3 + empates
+
+    gols_pro = [x["gols_pro"] for x in historico]
+    gols_contra = [x["gols_contra"] for x in historico]
+
+    # Estatísticas detalhadas das últimas partidas.
+    # Para não explodir o limite da API, usamos no máximo 8.
+    esc_pro = []
+    esc_contra = []
+    finalizacoes = []
+    finalizacoes_alvo = []
+    ataques_perigosos = []
+    recuperacoes = []
+
+    limite_stats = min(8, len(historico))
+
+    for jogo in historico[:limite_stats]:
+        dados = obter_stats_historico_fixture(jogo["fixture_id"])
+
+        if not dados:
             continue
 
-        home_id = home.get(
-            "id"
-        )
+        bloco_time = None
+        bloco_oponente = None
 
-        away_id = away.get(
-            "id"
-        )
-
-        if home_id == team_id:
-
-            marcados = hg
-            sofridos = ag
-
-            casa_marcados.append(hg)
-            casa_sofridos.append(ag)
-
-            if hg > ag:
-                resultados.append("V")
-
-            elif hg == ag:
-                resultados.append("E")
-
+        for bloco in dados:
+            if bloco.get("team_id") == team_id:
+                bloco_time = bloco.get("stats", {})
             else:
-                resultados.append("D")
+                bloco_oponente = bloco.get("stats", {})
 
-        elif away_id == team_id:
-
-            marcados = ag
-            sofridos = hg
-
-            fora_marcados.append(ag)
-            fora_sofridos.append(hg)
-
-            if ag > hg:
-                resultados.append("V")
-
-            elif ag == hg:
-                resultados.append("E")
-
-            else:
-                resultados.append("D")
-
-        else:
+        if not bloco_time:
             continue
 
-        gols_marcados.append(
-            marcados
+        esc_pro.append(
+            safe_float(bloco_time.get("Corner Kicks"))
         )
 
-        gols_sofridos.append(
-            sofridos
+        if bloco_oponente:
+            esc_contra.append(
+                safe_float(bloco_oponente.get("Corner Kicks"))
+            )
+
+        finalizacoes.append(
+            safe_float(bloco_time.get("Total Shots"))
         )
 
-    if len(gols_marcados) < 5:
+        finalizacoes_alvo.append(
+            safe_float(bloco_time.get("Shots on Goal"))
+        )
 
-        CACHE_FORMA[
-            team_id
-        ] = None
-
-        return None
-
-    # =====================================================
-    # PESOS
-    # =====================================================
-
-    pesos = []
-
-    for i in range(
-        len(gols_marcados)
-    ):
-
-        if i < 5:
-            pesos.append(1.5)
-
-        else:
-            pesos.append(1.0)
-
-    soma_pesos = sum(
-        pesos
-    )
-
-    media_marcados = (
-        sum(
-            g * p
-            for g, p in zip(
-                gols_marcados,
-                pesos
+        # Algumas contas/API não fornecem esses campos.
+        # Se existirem, aproveitamos.
+        ataques_perigosos.append(
+            safe_float(
+                bloco_time.get("Dangerous Attacks")
             )
         )
-        / soma_pesos
-    )
 
-    media_sofridos = (
-        sum(
-            g * p
-            for g, p in zip(
-                gols_sofridos,
-                pesos
+        recuperacoes.append(
+            safe_float(
+                bloco_time.get("Ball Possession")
             )
         )
-        / soma_pesos
-    )
 
-    def media(lista, padrao):
+    casa_gols = [
+        x["gols_pro"] for x in historico
+        if x["casa"]
+    ]
 
-        if not lista:
-            return padrao
+    fora_gols = [
+        x["gols_pro"] for x in historico
+        if not x["casa"]
+    ]
 
-        return sum(lista) / len(lista)
-
-    resultado = {
-
-        "jogos": len(
-            gols_marcados
+    return {
+        "jogos": len(historico),
+        "vitorias": vitorias,
+        "empates": empates,
+        "derrotas": derrotas,
+        "pontos": pontos,
+        "gols_pro": sum(gols_pro),
+        "gols_contra": sum(gols_contra),
+        "media_gols_pro": media_ponderada(gols_pro),
+        "media_gols_contra": media_ponderada(gols_contra),
+        "casa_media_gols": (
+            media_ponderada(casa_gols) if casa_gols else 0
         ),
-
-        "gols_marcados":
-            media_marcados,
-
-        "gols_sofridos":
-            media_sofridos,
-
-        "casa_marcados":
-            media(
-                casa_marcados,
-                media_marcados
-            ),
-
-        "casa_sofridos":
-            media(
-                casa_sofridos,
-                media_sofridos
-            ),
-
-        "fora_marcados":
-            media(
-                fora_marcados,
-                media_marcados
-            ),
-
-        "fora_sofridos":
-            media(
-                fora_sofridos,
-                media_sofridos
-            ),
-
-        "forma":
-            resultados[:5]
+        "fora_media_gols": (
+            media_ponderada(fora_gols) if fora_gols else 0
+        ),
+        "escanteios_pro": (
+            media_ponderada(esc_pro) if esc_pro else 0
+        ),
+        "escanteios_contra": (
+            media_ponderada(esc_contra) if esc_contra else 0
+        ),
+        "finalizacoes": (
+            media_ponderada(finalizacoes) if finalizacoes else 0
+        ),
+        "finalizacoes_alvo": (
+            media_ponderada(finalizacoes_alvo)
+            if finalizacoes_alvo else 0
+        ),
+        "ataques_perigosos": (
+            media_ponderada(ataques_perigosos)
+            if ataques_perigosos else 0
+        ),
+        "recuperacoes": (
+            media_ponderada(recuperacoes)
+            if recuperacoes else 0
+        ),
+        "amostra_stats": len(finalizacoes),
     }
 
-    CACHE_FORMA[
-        team_id
-    ] = resultado
+
+# ============================================================
+# ÍNDICES DO JOGO
+# ============================================================
+
+def calcular_pressao(stats, lado):
+    """
+    Índice de pressão live.
+    É um índice interno, não uma probabilidade matemática.
+    """
+    outro = "away" if lado == "home" else "home"
+
+    ataques = stat(stats, "Dangerous Attacks", lado)
+    ataques_op = stat(stats, "Dangerous Attacks", outro)
+
+    chutes = stat(stats, "Total Shots", lado)
+    chutes_op = stat(stats, "Total Shots", outro)
+
+    alvo = stat(stats, "Shots on Goal", lado)
+    alvo_op = stat(stats, "Shots on Goal", outro)
+
+    esc = stat(stats, "Corner Kicks", lado)
+    esc_op = stat(stats, "Corner Kicks", outro)
+
+    posse = stat(stats, "Ball Possession", lado)
+    posse_op = stat(stats, "Ball Possession", outro)
+
+    # Se algum fornecedor não disponibilizar "Dangerous Attacks",
+    # os demais componentes continuam funcionando.
+    ataque_diff = max(-20, min(20, ataques - ataques_op)) * 1.2
+    chute_diff = max(-10, min(10, chutes - chutes_op)) * 2.0
+    alvo_diff = max(-6, min(6, alvo - alvo_op)) * 3.0
+    esc_diff = max(-5, min(5, esc - esc_op)) * 2.0
+    posse_diff = max(-30, min(30, posse - posse_op)) * 0.20
+
+    score = 50 + ataque_diff + chute_diff + alvo_diff + esc_diff + posse_diff
+
+    return max(0, min(100, score))
+
+
+def calcular_indice_ofensivo_live(stats, lado):
+    """
+    Mede produção ofensiva atual.
+    """
+    outro = "away" if lado == "home" else "away"
+
+    chutes = stat(stats, "Total Shots", lado)
+    alvo = stat(stats, "Shots on Goal", lado)
+    ataques = stat(stats, "Dangerous Attacks", lado)
+    esc = stat(stats, "Corner Kicks", lado)
+
+    base = (
+        chutes * 4.0 +
+        alvo * 7.0 +
+        ataques * 0.35 +
+        esc * 3.0
+    )
+
+    return max(0, min(100, base))
+
+
+def calcular_indice_escanteios(stats, forma_home, forma_away):
+    """
+    Tendência de escanteios combinando:
+      - histórico;
+      - escanteios live;
+      - pressão atual.
+    """
+    live_h = stat(stats, "Corner Kicks", "home")
+    live_a = stat(stats, "Corner Kicks", "away")
+
+    press_h = calcular_pressao(stats, "home")
+    press_a = calcular_pressao(stats, "away")
+
+    historico_h = (
+        forma_home["escanteios_pro"] +
+        forma_away["escanteios_contra"]
+    ) / 2
+
+    historico_a = (
+        forma_away["escanteios_pro"] +
+        forma_home["escanteios_contra"]
+    ) / 2
+
+    tendencia_h = (
+        historico_h * 0.45 +
+        live_h * 0.30 +
+        (press_h / 100 * 8) * 0.25
+    )
+
+    tendencia_a = (
+        historico_a * 0.45 +
+        live_a * 0.30 +
+        (press_a / 100 * 8) * 0.25
+    )
+
+    return tendencia_h, tendencia_a
+
+
+def calcular_forca_prejogo(forma):
+    """
+    Índice baseado na forma histórica.
+    """
+    jogos = max(1, forma["jogos"])
+
+    pontos_jogo = forma["pontos"] / jogos
+
+    ataque = forma["media_gols_pro"]
+    defesa = forma["media_gols_contra"]
+
+    score = (
+        50
+        + (pontos_jogo - 1.5) * 15
+        + (ataque - defesa) * 12
+    )
+
+    return max(0, min(100, score))
+
+
+def calcular_indice_vitoria(jogo, stats, forma_h, forma_a):
+    """
+    Não é probabilidade de vitória.
+    É um índice de domínio/tendência do momento.
+    """
+    pre_h = calcular_forca_prejogo(forma_h)
+    pre_a = calcular_forca_prejogo(forma_a)
+
+    live_h = calcular_pressao(stats, "home")
+    live_a = calcular_pressao(stats, "away")
+
+    ofens_h = calcular_indice_ofensivo_live(stats, "home")
+    ofens_a = calcular_indice_ofensivo_live(stats, "away")
+
+    # 35% histórico, 45% pressão live, 20% produção ofensiva
+    score_h = pre_h * 0.35 + live_h * 0.45 + ofens_h * 0.20
+    score_a = pre_a * 0.35 + live_a * 0.45 + ofens_a * 0.20
+
+    return max(0, min(100, score_h)), max(0, min(100, score_a))
+
+
+def calcular_sinal_recuperacao(stats):
+    """
+    API-Football nem sempre fornece recuperações.
+    Quando o dado não existe, não inventamos.
+    Usamos posse/pressão como complemento.
+    """
+    # Nem todos os provedores têm "Ball Recoveries".
+    h = stat(stats, "Ball Recoveries", "home")
+    a = stat(stats, "Ball Recoveries", "away")
+
+    if h == 0 and a == 0:
+        return None
+
+    return h, a
+
+
+# ============================================================
+# GERAÇÃO DO ALERTA
+# ============================================================
+
+def qualidade_sinal(score):
+    if score >= 78:
+        return "MUITO FORTE"
+    if score >= 68:
+        return "FORTE"
+    if score >= 58:
+        return "MODERADO"
+    return "BAIXO"
+
+
+def construir_analise(jogo):
+    fixture_id = jogo["id"]
+
+    live_raw = obter_estatisticas_live(fixture_id)
+
+    if not live_raw:
+        return None
+
+    stats = organizar_stats_live(
+        live_raw,
+        jogo["home_id"],
+        jogo["away_id"]
+    )
+
+    forma_h = calcular_forma(jogo["home_id"])
+    forma_a = calcular_forma(jogo["away_id"])
+
+    press_h = calcular_pressao(stats, "home")
+    press_a = calcular_pressao(stats, "away")
+
+    forca_h, forca_a = calcular_indice_vitoria(
+        jogo,
+        stats,
+        forma_h,
+        forma_a
+    )
+
+    esc_h, esc_a = calcular_indice_escanteios(
+        stats,
+        forma_h,
+        forma_a
+    )
+
+    recuperacoes = calcular_sinal_recuperacao(stats)
+
+    resultado = {
+        "press_h": press_h,
+        "press_a": press_a,
+        "forca_h": forca_h,
+        "forca_a": forca_a,
+        "esc_h": esc_h,
+        "esc_a": esc_a,
+        "recuperacoes": recuperacoes,
+        "forma_h": forma_h,
+        "forma_a": forma_a,
+        "stats": stats,
+    }
 
     return resultado
 
 
-# =========================================================
-# MODELO DE GOLS
-# =========================================================
+def gerar_sinais(jogo, analise):
+    sinais = []
 
-def modelo_poisson(
-    forma_casa,
-    forma_fora
-):
+    stats = analise["stats"]
+    ph = analise["press_h"]
+    pa = analise["press_a"]
+    fh = analise["forca_h"]
+    fa = analise["forca_a"]
+    eh = analise["esc_h"]
+    ea = analise["esc_a"]
 
-    if (
-        not forma_casa
-        or not forma_fora
-    ):
-        return None
+    minuto = jogo["minute"]
 
-    # =====================================================
-    # ATAQUE
-    # =====================================================
+    # --------------------------------------------------------
+    # PRESSÃO
+    # --------------------------------------------------------
+    diff_press = abs(ph - pa)
 
-    ataque_casa = (
-        forma_casa[
-            "casa_marcados"
-        ] * 0.65
+    if max(ph, pa) >= 65 and diff_press >= 12:
+        lado = "home" if ph > pa else "away"
+        nome = jogo["home"] if lado == "home" else jogo["away"]
+        score = max(ph, pa)
 
-        + forma_casa[
-            "gols_marcados"
-        ] * 0.35
-    )
-
-    ataque_fora = (
-        forma_fora[
-            "fora_marcados"
-        ] * 0.65
-
-        + forma_fora[
-            "gols_marcados"
-        ] * 0.35
-    )
-
-    # =====================================================
-    # DEFESA
-    # =====================================================
-
-    defesa_casa = (
-        forma_casa[
-            "casa_sofridos"
-        ] * 0.65
-
-        + forma_casa[
-            "gols_sofridos"
-        ] * 0.35
-    )
-
-    defesa_fora = (
-        forma_fora[
-            "fora_sofridos"
-        ] * 0.65
-
-        + forma_fora[
-            "gols_sofridos"
-        ] * 0.35
-    )
-
-    # =====================================================
-    # EXPECTATIVA DE GOLS
-    # =====================================================
-
-    lambda_casa = (
-        ataque_casa * 0.55
-        + defesa_fora * 0.45
-    )
-
-    lambda_fora = (
-        ataque_fora * 0.55
-        + defesa_casa * 0.45
-    )
-
-    # Limites de segurança
-    lambda_casa = max(
-        0.20,
-        min(
-            lambda_casa,
-            4.00
-        )
-    )
-
-    lambda_fora = max(
-        0.20,
-        min(
-            lambda_fora,
-            4.00
-        )
-    )
-
-    # =====================================================
-    # PROBABILIDADES
-    # =====================================================
-
-    prob_casa = 0.0
-    prob_empate = 0.0
-    prob_fora = 0.0
-
-    prob_over_15 = 0.0
-    prob_over_25 = 0.0
-    prob_over_35 = 0.0
-
-    prob_btts = 0.0
-
-    # 0-12 gols para reduzir
-    # truncamento do modelo
-    for gols_casa in range(0, 13):
-
-        p_casa = poisson(
-            gols_casa,
-            lambda_casa
-        )
-
-        for gols_fora in range(0, 13):
-
-            p_fora = poisson(
-                gols_fora,
-                lambda_fora
+        sinais.append({
+            "tipo": "PRESSAO",
+            "lado": lado,
+            "nome": nome,
+            "score": score,
+            "texto": (
+                f"🔥 Pressão ofensiva de <b>{nome}</b>\n"
+                f"Índice de pressão: {score:.0f}/100"
             )
-
-            prob = (
-                p_casa
-                * p_fora
-            )
-
-            if gols_casa > gols_fora:
-
-                prob_casa += prob
-
-            elif gols_casa == gols_fora:
-
-                prob_empate += prob
-
-            else:
-
-                prob_fora += prob
-
-            total = (
-                gols_casa
-                + gols_fora
-            )
-
-            if total >= 2:
-                prob_over_15 += prob
-
-            if total >= 3:
-                prob_over_25 += prob
-
-            if total >= 4:
-                prob_over_35 += prob
-
-            if (
-                gols_casa > 0
-                and gols_fora > 0
-            ):
-                prob_btts += prob
-
-    # =====================================================
-    # NORMALIZAR 1X2
-    # =====================================================
-
-    soma_1x2 = (
-        prob_casa
-        + prob_empate
-        + prob_fora
-    )
-
-    if soma_1x2 > 0:
-
-        prob_casa /= soma_1x2
-        prob_empate /= soma_1x2
-        prob_fora /= soma_1x2
-
-    return {
-
-        "casa":
-            prob_casa,
-
-        "empate":
-            prob_empate,
-
-        "fora":
-            prob_fora,
-
-        "over_1.5":
-            prob_over_15,
-
-        "under_1.5":
-            1 - prob_over_15,
-
-        "over_2.5":
-            prob_over_25,
-
-        "under_2.5":
-            1 - prob_over_25,
-
-        "over_3.5":
-            prob_over_35,
-
-        "under_3.5":
-            1 - prob_over_35,
-
-        "btts_yes":
-            prob_btts,
-
-        "btts_no":
-            1 - prob_btts,
-
-        "lambda_casa":
-            lambda_casa,
-
-        "lambda_fora":
-            lambda_fora
-    }
-
-
-# =========================================================
-# PROBABILIDADE DO MODELO PARA CADA SELEÇÃO
-# =========================================================
-
-def probabilidade_modelo(
-    mercado,
-    selecao,
-    ponto,
-    home,
-    away,
-    modelo
-):
-
-    if not modelo:
-        return None
-
-    # =====================================================
-    # 1X2
-    # =====================================================
-
-    if mercado == "h2h":
-
-        if selecao == home:
-            return modelo["casa"]
-
-        if selecao == away:
-            return modelo["fora"]
-
-        if selecao.lower() in [
-            "draw",
-            "empate"
-        ]:
-            return modelo["empate"]
-
-    # =====================================================
-    # BTTS
-    # =====================================================
-
-    if mercado == "btts":
-
-        if selecao.lower() in [
-            "yes",
-            "sim"
-        ]:
-            return modelo["btts_yes"]
-
-        if selecao.lower() in [
-            "no",
-            "não",
-            "nao"
-        ]:
-            return modelo["btts_no"]
-
-    # =====================================================
-    # TOTALS
-    # =====================================================
-
-    if mercado == "totals":
-
-        if ponto is None:
-            return None
-
-        try:
-            ponto = float(ponto)
-        except Exception:
-            return None
-
-        if selecao.lower() == "over":
-
-            if ponto == 1.5:
-                return modelo["over_1.5"]
-
-            if ponto == 2.5:
-                return modelo["over_2.5"]
-
-            if ponto == 3.5:
-                return modelo["over_3.5"]
-
-        if selecao.lower() == "under":
-
-            if ponto == 1.5:
-                return modelo["under_1.5"]
-
-            if ponto == 2.5:
-                return modelo["under_2.5"]
-
-            if ponto == 3.5:
-                return modelo["under_3.5"]
-
-    return None
-
-
-# =========================================================
-# MODELO DO JOGO
-# =========================================================
-
-def obter_modelo_jogo(
-    home,
-    away,
-    ids_equipes
-):
-
-    if not ids_equipes:
-        return None
-
-    home_id = ids_equipes.get(
-        normalizar_nome(home)
-    )
-
-    away_id = ids_equipes.get(
-        normalizar_nome(away)
-    )
-
-    if not home_id or not away_id:
-        return None
-
-    forma_home = calcular_forma_equipe(
-        home_id
-    )
-
-    forma_away = calcular_forma_equipe(
-        away_id
-    )
-
-    return modelo_poisson(
-        forma_home,
-        forma_away
-    )
-
-
-# =========================================================
-# ANALISAR JOGO
-# =========================================================
-
-def analisar_jogo(
-    jogo,
-    mercado,
-    consenso,
-    ids_equipes
-):
-
-    home = jogo.get(
-        "home_team"
-    )
-
-    away = jogo.get(
-        "away_team"
-    )
-
-    if not home or not away:
-        return []
-
-    modelo = obter_modelo_jogo(
-        home,
-        away,
-        ids_equipes
-    )
-
-    resultados = []
-
-    for chave, dados in consenso.items():
-
-        selecao = dados.get(
-            "selecao",
-            chave
-        )
-
-        ponto = dados.get(
-            "point"
-        )
-
-        prob_market = dados.get(
-            "probabilidade"
-        )
-
-        odd = dados.get(
-            "odd"
-        )
-
-        if (
-            prob_market is None
-            or odd is None
-        ):
-            continue
-
-        try:
-
-            prob_market = float(
-                prob_market
-            )
-
-            odd = float(
-                odd
-            )
-
-        except Exception:
-            continue
-
-        if odd <= 1:
-            continue
-
-        # =================================================
-        # PROBABILIDADE DO MODELO
-        # =================================================
-
-        prob_modelo = probabilidade_modelo(
-            mercado,
-            selecao,
-            ponto,
-            home,
-            away,
-            modelo
-        )
-
-        # =================================================
-        # COMBINAÇÃO
-        # =================================================
-
-        if prob_modelo is not None:
-
-            diferenca = (
-                prob_modelo
-                - prob_market
-            )
-
-            # Só mistura o modelo se ele
-            # estiver razoavelmente afastado
-            # do mercado.
-            if abs(diferenca) >= DIFERENCA_MODELO_MINIMA:
-
-                prob_final = (
-                    prob_modelo
-                    * PESO_MODELO
-                    +
-                    prob_market
-                    * PESO_MERCADO
-                )
-
-                origem = (
-                    "Poisson + mercado"
-                )
-
-                modelo_utilizado = True
-
-            else:
-
-                # Quando modelo e mercado
-                # estão muito próximos,
-                # usamos o consenso de mercado.
-                prob_final = prob_market
-
-                origem = (
-                    "consenso das casas"
-                )
-
-                modelo_utilizado = False
-
-        else:
-
-            prob_final = prob_market
-
-            origem = (
-                "consenso das casas"
-            )
-
-            modelo_utilizado = False
-
-        # =================================================
-        # EV
-        # =================================================
-
-        ev = (
-            (
-                prob_final
-                * odd
-            ) - 1
-        ) * 100
-
-        # =================================================
-        # ODD JUSTA
-        # =================================================
-
-        if prob_final > 0:
-
-            odd_justa = (
-                1 / prob_final
-            )
-
-        else:
-
-            odd_justa = 0
-
-        # =================================================
-        # KELLY
-        # =================================================
-
-        stake = calcular_kelly(
-            prob_final,
-            odd
-        )
-
-        # =================================================
-        # CONSISTÊNCIA DO MERCADO
-        # =================================================
-
-        dispersao = dados.get(
-            "dispersao",
-            0
-        )
-
-        if dispersao <= 0.025:
-
-            consistencia = "alta"
-
-        elif dispersao <= 0.05:
-
-            consistencia = "média"
-
-        else:
-
-            consistencia = "baixa"
-
-        # =================================================
-        # DIFERENÇA MODELO / MERCADO
-        # =================================================
-
-        if prob_modelo is not None:
-
-            diferenca_modelo = (
-                prob_modelo
-                - prob_market
-            )
-
-        else:
-
-            diferenca_modelo = None
-
-        resultados.append({
-
-            "home": home,
-
-            "away": away,
-
-            "mercado": mercado,
-
-            "selecao": selecao,
-
-            "point": ponto,
-
-            "odd": odd,
-
-            "casa": dados.get(
-                "casa",
-                "Mercado"
-            ),
-
-            "probabilidade":
-                prob_final,
-
-            "prob_market":
-                prob_market,
-
-            "prob_modelo":
-                prob_modelo,
-
-            "diferenca_modelo":
-                diferenca_modelo,
-
-            "odd_justa":
-                odd_justa,
-
-            "ev":
-                ev,
-
-            "stake":
-                stake,
-
-            "casas":
-                dados.get(
-                    "casas",
-                    0
-                ),
-
-            "dispersao":
-                dispersao,
-
-            "consistencia":
-                consistencia,
-
-            "origem":
-                origem,
-
-            "modelo":
-                modelo_utilizado
         })
 
-    return resultados
+    # --------------------------------------------------------
+    # ESCANTEIOS
+    # --------------------------------------------------------
+    diff_esc = abs(eh - ea)
 
+    if max(eh, ea) >= 4.0 and diff_esc >= 1.2:
+        lado = "home" if eh > ea else "away"
+        nome = jogo["home"] if lado == "home" else jogo["away"]
+        score = min(100, 50 + diff_esc * 12 + max(ph, pa) * 0.25)
 
-# =========================================================
-# KELLY
-# =========================================================
+        # Exigimos também algum sinal live para evitar que
+        # somente o histórico gere alerta.
+        esc_live_h = stat(stats, "Corner Kicks", "home")
+        esc_live_a = stat(stats, "Corner Kicks", "away")
+        esc_live_diff = abs(esc_live_h - esc_live_a)
 
-def calcular_kelly(
-    probabilidade,
-    odd
-):
-
-    if (
-        probabilidade <= 0
-        or odd <= 1
-    ):
-        return 0.0
-
-    b = odd - 1
-
-    q = 1 - probabilidade
-
-    kelly = (
-        (
-            b
-            * probabilidade
-        )
-        - q
-    ) / b
-
-    if kelly < 0:
-        return 0.0
-
-    kelly *= KELLY_FRACAO
-
-    # Limite máximo de 5%
-    kelly = min(
-        kelly,
-        0.05
-    )
-
-    return BANCA * kelly
-
-
-# =========================================================
-# ANALISAR TODOS OS JOGOS
-# =========================================================
-
-def analisar_tudo():
-
-    # Limpa cache de forma
-    # a cada nova análise.
-    CACHE_FORMA.clear()
-
-    amanha = (
-        agora_brasilia().date()
-        + timedelta(days=1)
-    )
-
-    jogos_unicos = {}
-
-    # =====================================================
-    # COLETA ORIGINAL
-    # =====================================================
-
-    for esporte in COMPETICOES:
-
-        for mercado in MERCADOS:
-
-            eventos = buscar_odds(
-                esporte,
-                mercado
-            )
-
-            for evento in eventos:
-
-                data_evento = evento.get(
-                    "commence_time"
+        if esc_live_diff >= 1 or max(ph, pa) >= 70:
+            sinais.append({
+                "tipo": "ESCANTEIOS",
+                "lado": lado,
+                "nome": nome,
+                "score": score,
+                "texto": (
+                    f"🚩 Tendência de escanteios para "
+                    f"<b>{nome}</b>\n"
+                    f"Índice: {score:.0f}/100"
                 )
+            })
 
-                if not data_evento:
-                    continue
+    # --------------------------------------------------------
+    # DOMÍNIO / TENDÊNCIA DE RESULTADO
+    # --------------------------------------------------------
+    diff_forca = abs(fh - fa)
 
-                try:
+    if max(fh, fa) >= 70 and diff_forca >= 12:
+        lado = "home" if fh > fa else "away"
+        nome = jogo["home"] if lado == "home" else jogo["away"]
 
-                    data_utc = datetime.fromisoformat(
-                        data_evento.replace(
-                            "Z",
-                            "+00:00"
-                        )
-                    )
+        score = max(fh, fa)
 
-                    data_local = (
-                        data_utc
-                        .astimezone(
-                            TIMEZONE
-                        )
-                        .date()
-                    )
-
-                except Exception:
-                    continue
-
-                if data_local != amanha:
-                    continue
-
-                home = evento.get(
-                    "home_team"
-                )
-
-                away = evento.get(
-                    "away_team"
-                )
-
-                if not home or not away:
-                    continue
-
-                jogo_id = (
-                    f"{normalizar_nome(home)}_"
-                    f"{normalizar_nome(away)}"
-                )
-
-                if jogo_id not in jogos_unicos:
-
-                    jogos_unicos[jogo_id] = {
-                        "evento": evento,
-                        "mercados": {}
-                    }
-
-                jogos_unicos[
-                    jogo_id
-                ][
-                    "mercados"
-                ][
-                    mercado
-                ] = evento
-
-    total_jogos = len(
-        jogos_unicos
-    )
-
-    if total_jogos == 0:
-
-        return {
-            "total_jogos": 0,
-            "oportunidades": [],
-            "melhores": []
-        }
-
-    # =====================================================
-    # IDS
-    # =====================================================
-
-    ids_equipes = buscar_ids_equipes()
-
-    todas = []
-
-    # =====================================================
-    # ANALISAR
-    # =====================================================
-
-    for jogo_id, dados_jogo in jogos_unicos.items():
-
-        evento = dados_jogo[
-            "evento"
-        ]
-
-        for mercado, evento_mercado in dados_jogo[
-            "mercados"
-        ].items():
-
-            consenso = coletar_consenso(
-                evento_mercado,
-                mercado
+        sinais.append({
+            "tipo": "DOMINIO",
+            "lado": lado,
+            "nome": nome,
+            "score": score,
+            "texto": (
+                f"⚽ Domínio/tendência de resultado de "
+                f"<b>{nome}</b>\n"
+                f"Índice de domínio: {score:.0f}/100"
             )
+        })
 
-            if not consenso:
-                continue
+    # --------------------------------------------------------
+    # PRESSÃO + ESCANTEIOS
+    # --------------------------------------------------------
+    if max(ph, pa) >= 72:
+        lado = "home" if ph > pa else "away"
+        nome = jogo["home"] if lado == "home" else jogo["away"]
 
-            resultados = analisar_jogo(
-                evento,
-                mercado,
-                consenso,
-                ids_equipes
+        esc_live = stat(stats, "Corner Kicks", lado)
+
+        if esc_live >= 3:
+            sinais.append({
+                "tipo": "PRESSAO_ESCANTEIO",
+                "lado": lado,
+                "nome": nome,
+                "score": min(100, max(ph, pa) + 8),
+                "texto": (
+                    f"🔥🚩 Pressão + escanteios de <b>{nome}</b>\n"
+                    f"Pressão: {max(ph, pa):.0f}/100\n"
+                    f"Escanteios atuais: {esc_live:.0f}"
+                )
+            })
+
+    # --------------------------------------------------------
+    # GOL / MOMENTO OFENSIVO
+    # --------------------------------------------------------
+    ch = stat(stats, "Total Shots", "home")
+    ca = stat(stats, "Total Shots", "away")
+
+    alh = stat(stats, "Shots on Goal", "home")
+    ala = stat(stats, "Shots on Goal", "away")
+
+    if max(ph, pa) >= 72 and (max(alh, ala) >= 3 or max(ch, ca) >= 8):
+        lado = "home" if ph > pa else "away"
+        nome = jogo["home"] if lado == "home" else jogo["away"]
+
+        sinais.append({
+            "tipo": "MOMENTO_GOL",
+            "lado": lado,
+            "nome": nome,
+            "score": min(100, max(ph, pa)),
+            "texto": (
+                f"🎯 Forte momento ofensivo de <b>{nome}</b>\n"
+                f"Pressão: {max(ph, pa):.0f}/100\n"
+                f"Finalizações: {max(ch, ca):.0f}\n"
+                f"No alvo: {max(alh, ala):.0f}"
             )
+        })
 
-            todas.extend(
-                resultados
-            )
+    # Ordena pela intensidade, não por EV.
+    sinais.sort(key=lambda x: x["score"], reverse=True)
 
-    # =====================================================
-    # REMOVER DUPLICADOS
-    # =====================================================
+    return sinais
 
-    unicos = {}
 
-    for op in todas:
+# ============================================================
+# RELATÓRIO
+# ============================================================
 
-        chave = (
-            op["home"],
-            op["away"],
-            op["mercado"],
-            op["selecao"],
-            op.get("point")
-        )
+def historico_resumo(forma):
+    jogos = forma["jogos"]
 
-        atual = unicos.get(
-            chave
-        )
+    if jogos == 0:
+        return "Sem histórico disponível."
 
-        if (
-            atual is None
-            or op["ev"] > atual["ev"]
-        ):
+    aproveitamento = forma["pontos"] / (jogos * 3) * 100
 
-            unicos[chave] = op
-
-    finais = list(
-        unicos.values()
+    return (
+        f"Últimos {jogos}: "
+        f"{forma['vitorias']}V "
+        f"{forma['empates']}E "
+        f"{forma['derrotas']}D\n"
+        f"⚽ Gols: {forma['media_gols_pro']:.2f} "
+        f"marcados / {forma['media_gols_contra']:.2f} sofridos\n"
+        f"🚩 Escanteios a favor: "
+        f"{forma['escanteios_pro']:.1f}\n"
+        f"🎯 Finalizações: "
+        f"{forma['finalizacoes']:.1f}\n"
+        f"🎯 No alvo: "
+        f"{forma['finalizacoes_alvo']:.1f}\n"
+        f"📊 Aproveitamento de pontos: "
+        f"{aproveitamento:.0f}%"
     )
 
-    # =====================================================
-    # ORDENAR
-    # =====================================================
 
-    finais.sort(
-        key=lambda x: x["ev"],
-        reverse=True
-    )
+def montar_mensagem_jogo(jogo, analise, sinais):
+    stats = analise["stats"]
+    fh = analise["forma_h"]
+    fa = analise["forma_a"]
 
-    # =====================================================
-    # EV+
-    # =====================================================
+    minuto = jogo["minute"]
+    placar = f"{jogo['home_goals']} x {jogo['away_goals']}"
 
-    oportunidades = [
+    posse_h = stat(stats, "Ball Possession", "home")
+    posse_a = stat(stats, "Ball Possession", "away")
 
-        op
+    ch_h = stat(stats, "Total Shots", "home")
+    ch_a = stat(stats, "Total Shots", "away")
 
-        for op in finais
+    alvo_h = stat(stats, "Shots on Goal", "home")
+    alvo_a = stat(stats, "Shots on Goal", "away")
 
-        if (
-            op["ev"] >= EV_MINIMO
-            and
-            op["ev"] <= EV_MAXIMO
-        )
-    ]
+    esc_h = stat(stats, "Corner Kicks", "home")
+    esc_a = stat(stats, "Corner Kicks", "away")
 
-    oportunidades.sort(
-        key=lambda x: x["ev"],
-        reverse=True
-    )
-
-    # =====================================================
-    # MELHORES 5
-    # =====================================================
-
-    melhores = finais[:5]
-
-    return {
-
-        "total_jogos":
-            total_jogos,
-
-        "oportunidades":
-            oportunidades[:20],
-
-        "melhores":
-            melhores
-    }
-
-
-# =========================================================
-# FORMATAR OP
-# =========================================================
-
-def formatar_oportunidade(
-    op,
-    numero,
-    abaixo_do_filtro=False
-):
-
-    if abaixo_do_filtro:
-
-        titulo = (
-            f"🔎 MELHORES EV #{numero}"
-        )
-
-    else:
-
-        titulo = (
-            f"🔥 EV+ #{numero}"
-        )
-
-    if op["modelo"]:
-
-        modelo_texto = (
-            "Poisson + mercado"
-        )
-
-    else:
-
-        modelo_texto = (
-            "consenso das casas"
-        )
+    ataques_h = stat(stats, "Dangerous Attacks", "home")
+    ataques_a = stat(stats, "Dangerous Attacks", "away")
 
     texto = (
+        f"⚽ <b>{jogo['home']} x {jogo['away']}</b>\n"
+        f"🏆 {jogo['league']}\n"
+        f"⏱️ {minuto}' — <b>{placar}</b>\n\n"
 
-        f"{titulo}\n\n"
+        f"📡 <b>DADOS AO VIVO</b>\n"
+        f"🔥 Pressão: {analise['press_h']:.0f} x "
+        f"{analise['press_a']:.0f}\n"
+        f"🚩 Escanteios: {esc_h:.0f} x {esc_a:.0f}\n"
+        f"🎯 Finalizações: {ch_h:.0f} x {ch_a:.0f}\n"
+        f"🎯 No alvo: {alvo_h:.0f} x {alvo_a:.0f}\n"
+        f"⚡ Ataques perigosos: "
+        f"{ataques_h:.0f} x {ataques_a:.0f}\n"
+        f"📊 Posse: {posse_h:.0f}% x {posse_a:.0f}%\n\n"
 
-        f"⚽ {op['home']} x "
-        f"{op['away']}\n"
-
-        f"🕐 Amanhã\n\n"
-
-        f"📊 Mercado: "
-        f"{op['mercado']}\n"
-
-        f"🎯 Entrada: "
-        f"{op['selecao']}\n"
+        f"📚 <b>HISTÓRICO RECENTE</b>\n"
+        f"🏠 <b>{jogo['home']}</b>\n"
+        f"{historico_resumo(fh)}\n\n"
+        f"✈️ <b>{jogo['away']}</b>\n"
+        f"{historico_resumo(fa)}\n\n"
     )
 
-    # Mostrar ponto para totals
-    if (
-        op["mercado"] == "totals"
-        and op.get("point") is not None
-    ):
+    if sinais:
+        texto += "🚨 <b>SINAIS DETECTADOS</b>\n\n"
 
+        for i, sinal in enumerate(sinais[:4], 1):
+            texto += (
+                f"{i}. {sinal['texto']}\n"
+                f"📊 Intensidade: "
+                f"{qualidade_sinal(sinal['score'])}\n"
+                f"Índice: {sinal['score']:.0f}/100\n\n"
+            )
+    else:
         texto += (
-            f"📏 Linha: "
-            f"{op['point']:.1f}\n"
+            "🟡 <b>Nenhum sinal forte neste momento.</b>\n"
+            "O jogo continua sendo monitorado.\n\n"
         )
 
     texto += (
-
-        f"\n"
-
-        f"🏦 Melhor casa: "
-        f"{op['casa']}\n"
-
-        f"💰 Odd: "
-        f"{op['odd']:.2f}\n\n"
-
-        f"📈 Probabilidade estimada: "
-        f"{op['probabilidade'] * 100:.1f}%\n"
-
-        f"📐 Odd justa: "
-        f"{op['odd_justa']:.2f}\n"
-
-        f"💎 EV: "
-        f"{op['ev']:+.2f}%\n"
-
-        f"💵 Kelly 25%: "
-        f"R$ {op['stake']:.2f}\n\n"
-
-        f"🏦 Casas consideradas: "
-        f"{op['casas']}\n"
-
-        f"📊 Consistência: "
-        f"{op['consistencia']}\n"
-
-        f"🧠 Modelo: "
-        f"{modelo_texto}\n"
-    )
-
-    if op["prob_modelo"] is not None:
-
-        texto += (
-
-            f"📊 Prob. modelo: "
-            f"{op['prob_modelo'] * 100:.1f}%\n"
-
-            f"📊 Prob. mercado: "
-            f"{op['prob_market'] * 100:.1f}%\n"
-        )
-
-    texto += (
-
-        "\n⚠️ Estimativa estatística. "
-        "Não garante resultado."
+        "⚠️ <i>Os índices são estimativas estatísticas para "
+        "auxiliar a análise ao vivo. Não são garantia de resultado "
+        "ou de lucro. Faça qualquer decisão manualmente.</i>"
     )
 
     return texto
 
 
-# =========================================================
-# START
-# =========================================================
+# ============================================================
+# CONTROLE DE ALERTAS
+# ============================================================
 
-@bot.message_handler(
-    commands=["start"]
-)
-def start(message):
+def chave_alerta(fixture_id, sinal):
+    return f"{fixture_id}:{sinal['tipo']}:{sinal['lado']}"
 
-    global CHAT_ID
 
-    CHAT_ID = message.chat.id
+def pode_alertar(chave):
+    ultimo = LAST_ALERT.get(chave)
 
-    bot.send_message(
+    if ultimo is None:
+        return True
 
-        message.chat.id,
+    return time.time() - ultimo >= ALERT_COOLDOWN * 60
 
-        "🤖 Múltiplas do LC conectado!\n\n"
 
-        "Use /odds para analisar "
-        "as oportunidades de amanhã."
-    )
+def registrar_alerta(chave):
+    LAST_ALERT[chave] = time.time()
 
 
-# =========================================================
-# ODDS
-# =========================================================
+# ============================================================
+# MONITORAMENTO
+# ============================================================
 
-@bot.message_handler(
-    commands=["odds"]
-)
-def odds(message):
+def monitorar():
+    global MONITORANDO
 
-    global CHAT_ID
-
-    CHAT_ID = message.chat.id
-
-    bot.send_message(
-
-        message.chat.id,
-
-        "🔎 Analisando as odds "
-        "e os dados estatísticos..."
-    )
-
-    resultado = analisar_tudo()
-
-    total_jogos = resultado[
-        "total_jogos"
-    ]
-
-    oportunidades = resultado[
-        "oportunidades"
-    ]
-
-    melhores = resultado[
-        "melhores"
-    ]
-
-    # =====================================================
-    # ZERO JOGOS
-    # =====================================================
-
-    if total_jogos == 0:
-
-        bot.send_message(
-
-            message.chat.id,
-
-            "📊 ANÁLISE CONCLUÍDA\n\n"
-
-            "⚽ Jogos analisados: 0\n\n"
-
-            "Nenhum jogo de amanhã "
-            "foi encontrado nas "
-            "competições configuradas."
-        )
-
-        return
-
-    # =====================================================
-    # EV+
-    # =====================================================
-
-    if oportunidades:
-
-        bot.send_message(
-
-            message.chat.id,
-
-            "📊 ANÁLISE CONCLUÍDA\n\n"
-
-            f"⚽ Jogos analisados: "
-            f"{total_jogos}\n"
-
-            f"🔥 Oportunidades EV+: "
-            f"{len(oportunidades)}\n\n"
-
-            f"Filtro EV: "
-            f"{EV_MINIMO:.0f}% a "
-            f"{EV_MAXIMO:.0f}%\n"
-
-            f"Mínimo de casas: "
-            f"{MINIMO_CASAS}"
-        )
-
-        for i, op in enumerate(
-            oportunidades,
-            start=1
-        ):
-
-            try:
-
-                bot.send_message(
-
-                    message.chat.id,
-
-                    formatar_oportunidade(
-                        op,
-                        i
-                    )
-                )
-
-                time.sleep(0.4)
-
-            except Exception:
-                pass
-
-        return
-
-    # =====================================================
-    # SEM EV+
-    # =====================================================
-
-    bot.send_message(
-
-        message.chat.id,
-
-        "📊 ANÁLISE CONCLUÍDA\n\n"
-
-        f"⚽ Jogos analisados: "
-        f"{total_jogos}\n\n"
-
-        "❌ Nenhuma oportunidade "
-        "EV+ encontrada dentro "
-        "dos filtros atuais.\n\n"
-
-        f"EV mínimo: "
-        f"{EV_MINIMO:.0f}%\n"
-
-        f"EV máximo: "
-        f"{EV_MAXIMO:.0f}%\n"
-
-        f"Mínimo de casas: "
-        f"{MINIMO_CASAS}\n\n"
-
-        "🔎 Enviando as 5 melhores "
-        "seleções encontradas."
-    )
-
-    if melhores:
-
-        for i, op in enumerate(
-            melhores,
-            start=1
-        ):
-
-            try:
-
-                bot.send_message(
-
-                    message.chat.id,
-
-                    formatar_oportunidade(
-                        op,
-                        i,
-                        abaixo_do_filtro=True
-                    )
-                )
-
-                time.sleep(0.4)
-
-            except Exception:
-                pass
-
-    else:
-
-        bot.send_message(
-
-            message.chat.id,
-
-            "ℹ️ Nenhuma seleção válida "
-            f"com pelo menos "
-            f"{MINIMO_CASAS} casas."
-        )
-
-
-# =========================================================
-# OUTRAS MENSAGENS
-# =========================================================
-
-@bot.message_handler(
-    func=lambda message: True
-)
-def outras_mensagens(message):
-
-    bot.send_message(
-
-        message.chat.id,
-
-        "🤖 Comandos disponíveis:\n\n"
-
-        "/start — conectar o bot\n"
-
-        "/odds — analisar "
-        "oportunidades de amanhã"
-    )
-
-
-# =========================================================
-# ROTINA AUTOMÁTICA
-# =========================================================
-
-def rotina_diaria():
+    print("Monitor live iniciado.")
 
     while True:
-
         try:
+            if not MONITORANDO or CHAT_ID is None:
+                time.sleep(15)
+                continue
 
-            agora = agora_brasilia()
+            jogos = obter_jogos_ao_vivo()
 
-            if (
-                agora.hour == 9
-                and agora.minute == 0
-            ):
+            if jogos:
+                print(f"Jogos live encontrados: {len(jogos)}")
 
-                if CHAT_ID:
+            for jogo in jogos:
+                fixture_id = jogo["id"]
 
-                    resultado = analisar_tudo()
+                if not fixture_id:
+                    continue
 
-                    total_jogos = resultado[
-                        "total_jogos"
+                if fixture_id in PROCESSANDO:
+                    continue
+
+                PROCESSANDO.add(fixture_id)
+
+                try:
+                    analise = construir_analise(jogo)
+
+                    if not analise:
+                        continue
+
+                    sinais = gerar_sinais(jogo, analise)
+
+                    # Envia somente sinais relevantes.
+                    sinais_fortes = [
+                        s for s in sinais
+                        if s["score"] >= 68
                     ]
 
-                    oportunidades = resultado[
-                        "oportunidades"
-                    ]
+                    for sinal in sinais_fortes:
+                        chave = chave_alerta(fixture_id, sinal)
 
-                    melhores = resultado[
-                        "melhores"
-                    ]
+                        if not pode_alertar(chave):
+                            continue
 
-                    if oportunidades:
-
-                        bot.send_message(
-
-                            CHAT_ID,
-
-                            "🌅 ANÁLISE DIÁRIA\n\n"
-
-                            f"⚽ Jogos analisados: "
-                            f"{total_jogos}\n"
-
-                            f"🔥 EV+ encontrados: "
-                            f"{len(oportunidades)}"
+                        # Para não bombardear o Telegram:
+                        # enviamos uma análise completa.
+                        msg = montar_mensagem_jogo(
+                            jogo,
+                            analise,
+                            sinais
                         )
 
-                        for i, op in enumerate(
-                            oportunidades,
-                            start=1
-                        ):
-
+                        try:
                             bot.send_message(
-
                                 CHAT_ID,
-
-                                formatar_oportunidade(
-                                    op,
-                                    i
-                                )
+                                msg
                             )
+                            registrar_alerta(chave)
 
-                            time.sleep(0.4)
+                        except Exception as e:
+                            print("Erro enviando Telegram:", e)
 
-                    else:
+                        # Apenas um alerta por ciclo por partida.
+                        break
 
-                        bot.send_message(
+                finally:
+                    PROCESSANDO.discard(fixture_id)
 
-                            CHAT_ID,
+            time.sleep(LIVE_INTERVAL)
 
-                            "🌅 ANÁLISE DIÁRIA\n\n"
-
-                            f"⚽ Jogos analisados: "
-                            f"{total_jogos}\n\n"
-
-                            "❌ Nenhuma oportunidade "
-                            "EV+ dentro dos filtros.\n\n"
-
-                            "🔎 Enviando as 5 melhores."
-                        )
-
-                        for i, op in enumerate(
-                            melhores,
-                            start=1
-                        ):
-
-                            bot.send_message(
-
-                                CHAT_ID,
-
-                                formatar_oportunidade(
-                                    op,
-                                    i,
-                                    abaixo_do_filtro=True
-                                )
-                            )
-
-                            time.sleep(0.4)
-
-                time.sleep(61)
-
-        except Exception:
-            pass
-
-        time.sleep(30)
+        except Exception as e:
+            print("Erro no monitor:", e)
+            time.sleep(30)
 
 
-# =========================================================
-# FLASK
-# =========================================================
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+@bot.message_handler(commands=["start"])
+def start(message):
+    global CHAT_ID, MONITORANDO
+
+    CHAT_ID = message.chat.id
+    MONITORANDO = True
+
+    bot.send_message(
+        message.chat.id,
+        "🤖 <b>Monitor Live iniciado!</b>\n\n"
+        "Vou acompanhar os jogos das ligas configuradas "
+        "e procurar sinais estatísticos de:\n\n"
+        "🔥 pressão ofensiva\n"
+        "🚩 tendência de escanteios\n"
+        "⚽ domínio/tendência de resultado\n"
+        "🎯 momento ofensivo\n"
+        "📚 histórico recente das duas equipes\n\n"
+        f"⏱️ Atualização: a cada {LIVE_INTERVAL} segundos.\n\n"
+        "Use /jogos para ver partidas ao vivo.\n"
+        "Use /status para verificar o monitor."
+    )
+
+
+@bot.message_handler(commands=["status"])
+def status(message):
+    bot.send_message(
+        message.chat.id,
+        "🟢 <b>Monitor operacional</b>\n\n"
+        f"⏱️ Intervalo: {LIVE_INTERVAL}s\n"
+        f"📚 Histórico: últimos {HISTORY_MATCHES} jogos\n"
+        f"🏆 Competições configuradas: {len(LEAGUES)}\n"
+        f"📡 Monitoramento: {'ATIVO' if MONITORANDO else 'PAUSADO'}"
+    )
+
+
+@bot.message_handler(commands=["parar"])
+def parar(message):
+    global MONITORANDO
+    MONITORANDO = False
+
+    bot.send_message(
+        message.chat.id,
+        "⏸️ Monitoramento pausado.\n"
+        "Use /continuar para ativar novamente."
+    )
+
+
+@bot.message_handler(commands=["continuar"])
+def continuar(message):
+    global CHAT_ID, MONITORANDO
+
+    CHAT_ID = message.chat.id
+    MONITORANDO = True
+
+    bot.send_message(
+        message.chat.id,
+        "▶️ Monitoramento ao vivo ativado novamente."
+    )
+
+
+@bot.message_handler(commands=["jogos"])
+def jogos(message):
+    try:
+        lista = obter_jogos_ao_vivo()
+
+        if not lista:
+            bot.send_message(
+                message.chat.id,
+                "🟡 Nenhum jogo ao vivo das ligas configuradas "
+                "foi encontrado agora."
+            )
+            return
+
+        texto = "📡 <b>JOGOS AO VIVO</b>\n\n"
+
+        for jogo in lista[:30]:
+            texto += (
+                f"⚽ {jogo['home']} x {jogo['away']}\n"
+                f"🏆 {jogo['league']}\n"
+                f"⏱️ {jogo['minute']}' "
+                f"| {jogo['home_goals']} x {jogo['away_goals']}\n\n"
+            )
+
+        bot.send_message(message.chat.id, texto)
+
+    except Exception as e:
+        bot.send_message(
+            message.chat.id,
+            "❌ Não foi possível consultar os jogos agora."
+        )
+        print("Erro /jogos:", e)
+
+
+@bot.message_handler(commands=["analisar"])
+def analisar(message):
+    """
+    /analisar NOME
+    Mostra jogos live procurando o nome informado.
+    """
+    partes = message.text.split(maxsplit=1)
+
+    if len(partes) < 2:
+        bot.send_message(
+            message.chat.id,
+            "Use assim:\n"
+            "<code>/analisar Palmeiras</code>"
+        )
+        return
+
+    busca = normalizar_nome(partes[1])
+
+    jogos_live = obter_jogos_ao_vivo()
+
+    encontrados = [
+        j for j in jogos_live
+        if busca in normalizar_nome(j["home"])
+        or busca in normalizar_nome(j["away"])
+    ]
+
+    if not encontrados:
+        bot.send_message(
+            message.chat.id,
+            "🟡 Não encontrei esse time entre os jogos "
+            "ao vivo monitorados."
+        )
+        return
+
+    for jogo in encontrados:
+        analise = construir_analise(jogo)
+
+        if not analise:
+            continue
+
+        sinais = gerar_sinais(jogo, analise)
+
+        bot.send_message(
+            message.chat.id,
+            montar_mensagem_jogo(jogo, analise, sinais)
+        )
+
+
+@bot.message_handler(commands=["ligas"])
+def ligas(message):
+    texto = "🏆 <b>LIGAS MONITORADAS</b>\n\n"
+
+    for nome in LEAGUES.values():
+        texto += f"• {nome}\n"
+
+    bot.send_message(message.chat.id, texto)
+
+
+# ============================================================
+# HEALTH CHECK PARA RENDER
+# ============================================================
 
 @app.route("/")
 def home():
-
-    return "Múltiplas do LC online."
+    return "Monitor Live Futebol OK"
 
 
 @app.route("/health")
 def health():
+    return {
+        "status": "ok",
+        "monitorando": MONITORANDO,
+        "chat_configurado": CHAT_ID is not None,
+        "timestamp": agora().isoformat()
+    }
 
-    return "OK"
 
+# ============================================================
+# INICIALIZAÇÃO
+# ============================================================
 
-# =========================================================
-# SERVIDOR
-# =========================================================
-
-def iniciar_servidor():
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            10000
-        )
+def iniciar_monitor():
+    thread = threading.Thread(
+        target=monitorar,
+        daemon=True
     )
+    thread.start()
+
+
+def iniciar_telegram():
+    try:
+        print("Telegram polling iniciado.")
+        bot.infinity_polling(
+            timeout=30,
+            long_polling_timeout=30,
+            skip_pending=True
+        )
+    except Exception as e:
+        print("Erro no Telegram polling:", e)
+
+
+if __name__ == "__main__":
+    iniciar_monitor()
+
+    telegram_thread = threading.Thread(
+        target=iniciar_telegram,
+        daemon=True
+    )
+    telegram_thread.start()
+
+    # Render fornece PORT.
+    port = int(os.environ.get("PORT", "10000"))
 
     app.run(
         host="0.0.0.0",
         port=port
-    )
-
-
-# =========================================================
-# INICIAR
-# =========================================================
-
-if __name__ == "__main__":
-
-    threading.Thread(
-        target=iniciar_servidor,
-        daemon=True
-    ).start()
-
-    threading.Thread(
-        target=rotina_diaria,
-        daemon=True
-    ).start()
-
-    bot.infinity_polling(
-        timeout=30,
-        long_polling_timeout=30
     )
