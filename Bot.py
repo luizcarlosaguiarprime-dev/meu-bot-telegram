@@ -19,10 +19,17 @@ ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 
 EV_MINIMO = 3.0
 MINIMO_CASAS = 3
+
 KELLY_FRACAO = 0.25
 BANCA = 1000.00
 
 FUSO = ZoneInfo("America/Sao_Paulo")
+
+MERCADOS = [
+    "h2h",
+    "totals",
+    "btts"
+]
 
 ESPORTES = [
     "soccer_epl",
@@ -35,25 +42,24 @@ ESPORTES = [
     "soccer_uefa_europa_league",
     "soccer_uefa_europa_conference_league",
     "soccer_conmebol_libertadores",
-    "soccer_conmebol_sudamericana",
+    "soccer_conmebol_sudamericana"
 ]
 
-MERCADOS = [
-    "h2h",
-    "totals",
-    "btts",
-]
+
+# =========================================================
+# VERIFICAÇÃO DAS CHAVES
+# =========================================================
+
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN não configurado no Render.")
+
+if not ODDS_API_KEY:
+    raise ValueError("ODDS_API_KEY não configurado no Render.")
 
 
 # =========================================================
 # TELEGRAM
 # =========================================================
-
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN não configurado.")
-
-if not ODDS_API_KEY:
-    raise ValueError("ODDS_API_KEY não configurado.")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -61,7 +67,7 @@ CHAT_ID = None
 
 
 # =========================================================
-# FLASK PARA O RENDER
+# FLASK / RENDER
 # =========================================================
 
 app = Flask(__name__)
@@ -69,11 +75,11 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Bot de apostas online."
+    return "Bot de apostas online funcionando."
 
 
 # =========================================================
-# FUNÇÕES AUXILIARES
+# DATA / HORA
 # =========================================================
 
 def agora_brasilia():
@@ -81,30 +87,42 @@ def agora_brasilia():
 
 
 def data_amanha():
-    return (agora_brasilia() + timedelta(days=1)).date()
+    return (
+        agora_brasilia() +
+        timedelta(days=1)
+    ).date()
 
 
 def converter_data(data_texto):
+
     try:
         return datetime.fromisoformat(
             data_texto.replace("Z", "+00:00")
         )
+
     except Exception:
         return None
 
 
+# =========================================================
+# NOME DOS MERCADOS
+# =========================================================
+
 def nome_mercado(mercado):
+
     nomes = {
         "h2h": "Resultado",
         "totals": "Total de gols",
-        "btts": "Ambas marcam",
+        "btts": "Ambas marcam"
     }
 
-    return nomes.get(mercado, mercado)
+    return nomes.get(
+        mercado,
+        mercado
+    )
 
 
-def nome_resultado(outcome):
-    nome = outcome.get("name", "")
+def nome_resultado(nome):
 
     if nome == "Yes":
         return "Sim"
@@ -115,23 +133,25 @@ def nome_resultado(outcome):
     return nome
 
 
-def chave_outcome(outcome):
-    """
-    Cria uma chave única para o resultado.
+# =========================================================
+# CHAVE DO RESULTADO
+# =========================================================
 
-    Para totais:
-        Over + ponto
-        Under + ponto
+def chave_resultado(outcome):
 
-    Para os demais:
-        nome do resultado
-    """
+    nome = outcome.get(
+        "name",
+        ""
+    )
 
-    nome = outcome.get("name", "")
-    ponto = outcome.get("point")
+    point = outcome.get(
+        "point"
+    )
 
-    if ponto is not None:
-        return f"{nome}_{ponto}"
+    # Para totais:
+    # Over 2.5 / Under 2.5
+    if point is not None:
+        return f"{nome}_{point}"
 
     return nome
 
@@ -140,20 +160,7 @@ def chave_outcome(outcome):
 # PROBABILIDADE SEM MARGEM
 # =========================================================
 
-def probabilidades_sem_margem(outcomes):
-    """
-    Remove a margem da casa de apostas.
-
-    Para H2H e BTTS:
-        normaliza todos os resultados juntos.
-
-    Para TOTALS:
-        normaliza Over/Under apenas dentro da mesma linha.
-        Exemplo:
-            Over 2.5 + Under 2.5
-        não mistura com:
-            Over 3.5 + Under 3.5
-    """
+def calcular_probabilidades(outcomes):
 
     if not outcomes:
         return {}
@@ -161,25 +168,39 @@ def probabilidades_sem_margem(outcomes):
     grupos = {}
 
     for outcome in outcomes:
-        odd = outcome.get("price")
 
-        if not isinstance(odd, (int, float)):
+        odd = outcome.get(
+            "price"
+        )
+
+        if not isinstance(
+            odd,
+            (int, float)
+        ):
             continue
 
         if odd <= 1:
             continue
 
-        ponto = outcome.get("point")
+        point = outcome.get(
+            "point"
+        )
 
-        if ponto is None:
-            grupo = "sem_ponto"
+        # H2H / BTTS
+        if point is None:
+            grupo = "principal"
+
+        # Totais:
+        # cada linha é calculada separadamente
         else:
-            grupo = str(ponto)
+            grupo = str(point)
 
         if grupo not in grupos:
             grupos[grupo] = []
 
-        grupos[grupo].append(outcome)
+        grupos[grupo].append(
+            outcome
+        )
 
     probabilidades = {}
 
@@ -188,64 +209,81 @@ def probabilidades_sem_margem(outcomes):
         inversas = []
 
         for outcome in lista:
-            odd = outcome.get("price")
 
-            if isinstance(odd, (int, float)) and odd > 1:
-                inversas.append(1 / odd)
+            odd = outcome.get(
+                "price"
+            )
 
-        soma = sum(inversas)
+            if (
+                isinstance(
+                    odd,
+                    (int, float)
+                )
+                and odd > 1
+            ):
+                inversas.append(
+                    1 / odd
+                )
+
+        soma = sum(
+            inversas
+        )
 
         if soma <= 0:
             continue
 
         for outcome in lista:
 
-            odd = outcome.get("price")
+            odd = outcome.get(
+                "price"
+            )
 
-            if not isinstance(odd, (int, float)):
+            if not isinstance(
+                odd,
+                (int, float)
+            ):
                 continue
 
             if odd <= 1:
                 continue
 
-            probabilidade = (1 / odd) / soma
+            prob = (
+                (1 / odd) / soma
+            )
 
             probabilidades[
-                chave_outcome(outcome)
-            ] = probabilidade
+                chave_resultado(outcome)
+            ] = prob
 
     return probabilidades
 
 
 # =========================================================
-# BUSCA DE ODDS
+# BUSCAR ODDS
 # =========================================================
 
-def buscar_odds(esporte):
-    """
-    Faz uma única consulta por campeonato trazendo
-    os três mercados.
-
-    Isso evita fazer 3 chamadas separadas para cada campeonato.
-    """
+def buscar_odds(
+    esporte,
+    mercado
+):
 
     url = (
-        f"https://api.the-odds-api.com/v4/sports/"
-        f"{esporte}/odds"
+        "https://api.the-odds-api.com/v4/"
+        f"sports/{esporte}/odds"
     )
 
-    params = {
+    parametros = {
         "apiKey": ODDS_API_KEY,
         "regions": "eu",
-        "markets": ",".join(MERCADOS),
-        "oddsFormat": "decimal",
+        "markets": mercado,
+        "oddsFormat": "decimal"
     }
 
     try:
 
         resposta = requests.get(
             url,
-            params=params,
+            params=parametros,
             timeout=30
         )
 
@@ -254,7 +292,10 @@ def buscar_odds(esporte):
 
         dados = resposta.json()
 
-        if not isinstance(dados, list):
+        if not isinstance(
+            dados,
+            list
+        ):
             return []
 
         return dados
@@ -264,116 +305,140 @@ def buscar_odds(esporte):
 
 
 # =========================================================
-# COLETA E ORGANIZAÇÃO DOS JOGOS
+# COLETAR JOGOS
 # =========================================================
 
 def coletar_jogos():
-    """
-    Busca os jogos de amanhã em todos os campeonatos.
-    """
 
     jogos = {}
 
     amanha = data_amanha()
 
+    # -----------------------------------------------------
+    # Mantemos a busca separada por mercado.
+    # Esta é a estrutura que já funcionava.
+    # -----------------------------------------------------
+
     for esporte in ESPORTES:
 
-        eventos = buscar_odds(esporte)
+        for mercado in MERCADOS:
 
-        for evento in eventos:
-
-            commence_time = evento.get("commence_time")
-
-            if not commence_time:
-                continue
-
-            data_evento = converter_data(commence_time)
-
-            if not data_evento:
-                continue
-
-            data_evento_brasilia = data_evento.astimezone(FUSO)
-
-            if data_evento_brasilia.date() != amanha:
-                continue
-
-            jogo_id = evento.get("id")
-
-            if not jogo_id:
-                continue
-
-            if jogo_id not in jogos:
-
-                jogos[jogo_id] = {
-                    "id": jogo_id,
-                    "home_team": evento.get(
-                        "home_team",
-                        ""
-                    ),
-                    "away_team": evento.get(
-                        "away_team",
-                        ""
-                    ),
-                    "commence_time": data_evento_brasilia,
-                    "markets": {
-                        "h2h": {},
-                        "totals": {},
-                        "btts": {},
-                    },
-                }
-
-            bookmakers = evento.get(
-                "bookmakers",
-                []
+            eventos = buscar_odds(
+                esporte,
+                mercado
             )
 
-            for bookmaker in bookmakers:
+            for evento in eventos:
 
-                casa = bookmaker.get(
-                    "title",
-                    "Casa"
+                commence_time = evento.get(
+                    "commence_time"
                 )
 
-                mercados = bookmaker.get(
-                    "markets",
+                if not commence_time:
+                    continue
+
+                data_evento = converter_data(
+                    commence_time
+                )
+
+                if not data_evento:
+                    continue
+
+                data_brasilia = (
+                    data_evento.astimezone(
+                        FUSO
+                    )
+                )
+
+                # Somente jogos de amanhã
+                if data_brasilia.date() != amanha:
+                    continue
+
+                jogo_id = evento.get(
+                    "id"
+                )
+
+                if not jogo_id:
+                    continue
+
+                if jogo_id not in jogos:
+
+                    jogos[jogo_id] = {
+                        "id": jogo_id,
+                        "home_team": evento.get(
+                            "home_team",
+                            ""
+                        ),
+                        "away_team": evento.get(
+                            "away_team",
+                            ""
+                        ),
+                        "commence_time":
+                            data_brasilia,
+                        "markets": {
+                            "h2h": {},
+                            "totals": {},
+                            "btts": {}
+                        }
+                    }
+
+                bookmakers = evento.get(
+                    "bookmakers",
                     []
                 )
 
-                for market in mercados:
+                for bookmaker in bookmakers:
 
-                    tipo = market.get("key")
+                    casa = bookmaker.get(
+                        "title",
+                        "Casa"
+                    )
 
-                    if tipo not in MERCADOS:
-                        continue
-
-                    outcomes = market.get(
-                        "outcomes",
+                    mercados = bookmaker.get(
+                        "markets",
                         []
                     )
 
-                    if not outcomes:
-                        continue
+                    for market in mercados:
 
-                    # ---------------------------------
-                    # H2H
-                    # ---------------------------------
+                        tipo = market.get(
+                            "key"
+                        )
 
-                    if tipo == "h2h":
+                        if tipo != mercado:
+                            continue
+
+                        outcomes = market.get(
+                            "outcomes",
+                            []
+                        )
+
+                        if not outcomes:
+                            continue
 
                         probabilidades = (
-                            probabilidades_sem_margem(
+                            calcular_probabilidades(
                                 outcomes
                             )
                         )
 
                         for outcome in outcomes:
 
-                            chave = chave_outcome(
-                                outcome
-                            )
-
                             odd = outcome.get(
                                 "price"
+                            )
+
+                            if not isinstance(
+                                odd,
+                                (int, float)
+                            ):
+                                continue
+
+                            if odd <= 1:
+                                continue
+
+                            chave = chave_resultado(
+                                outcome
                             )
 
                             prob = probabilidades.get(
@@ -383,163 +448,70 @@ def coletar_jogos():
                             if prob is None:
                                 continue
 
-                            if not isinstance(
-                                odd,
-                                (int, float)
-                            ):
-                                continue
+                            if chave not in jogos[
+                                jogo_id
+                            ]["markets"][
+                                tipo
+                            ]:
+                                jogos[
+                                    jogo_id
+                                ]["markets"][
+                                    tipo
+                                ][chave] = []
 
-                            jogos[jogo_id][
-                                "markets"
-                            ][tipo].setdefault(
-                                chave,
-                                []
-                            ).append({
+                            jogos[
+                                jogo_id
+                            ]["markets"][
+                                tipo
+                            ][chave].append({
+
                                 "bookmaker": casa,
+
                                 "name": outcome.get(
                                     "name",
                                     ""
                                 ),
+
                                 "point": outcome.get(
                                     "point"
                                 ),
+
                                 "price": odd,
-                                "prob": prob,
-                            })
 
-                    # ---------------------------------
-                    # TOTALS
-                    # ---------------------------------
-
-                    elif tipo == "totals":
-
-                        probabilidades = (
-                            probabilidades_sem_margem(
-                                outcomes
-                            )
-                        )
-
-                        for outcome in outcomes:
-
-                            chave = chave_outcome(
-                                outcome
-                            )
-
-                            odd = outcome.get(
-                                "price"
-                            )
-
-                            prob = probabilidades.get(
-                                chave
-                            )
-
-                            if prob is None:
-                                continue
-
-                            if not isinstance(
-                                odd,
-                                (int, float)
-                            ):
-                                continue
-
-                            jogos[jogo_id][
-                                "markets"
-                            ][tipo].setdefault(
-                                chave,
-                                []
-                            ).append({
-                                "bookmaker": casa,
-                                "name": outcome.get(
-                                    "name",
-                                    ""
-                                ),
-                                "point": outcome.get(
-                                    "point"
-                                ),
-                                "price": odd,
-                                "prob": prob,
-                            })
-
-                    # ---------------------------------
-                    # BTTS
-                    # ---------------------------------
-
-                    elif tipo == "btts":
-
-                        probabilidades = (
-                            probabilidades_sem_margem(
-                                outcomes
-                            )
-                        )
-
-                        for outcome in outcomes:
-
-                            chave = chave_outcome(
-                                outcome
-                            )
-
-                            odd = outcome.get(
-                                "price"
-                            )
-
-                            prob = probabilidades.get(
-                                chave
-                            )
-
-                            if prob is None:
-                                continue
-
-                            if not isinstance(
-                                odd,
-                                (int, float)
-                            ):
-                                continue
-
-                            jogos[jogo_id][
-                                "markets"
-                            ][tipo].setdefault(
-                                chave,
-                                []
-                            ).append({
-                                "bookmaker": casa,
-                                "name": outcome.get(
-                                    "name",
-                                    ""
-                                ),
-                                "point": outcome.get(
-                                    "point"
-                                ),
-                                "price": odd,
-                                "prob": prob,
+                                "prob": prob
                             })
 
     return jogos
 
 
 # =========================================================
-# CONSENSO DE PROBABILIDADE
+# CONSENSO DAS CASAS
 # =========================================================
 
 def calcular_consenso(odds):
-    """
-    Usa a mediana das probabilidades das casas.
-
-    A mediana é menos afetada por uma casa muito fora
-    do padrão do mercado.
-    """
 
     probabilidades = []
 
     for item in odds:
 
-        prob = item.get("prob")
+        prob = item.get(
+            "prob"
+        )
 
-        if isinstance(prob, (int, float)):
-            probabilidades.append(prob)
+        if isinstance(
+            prob,
+            (int, float)
+        ):
+            probabilidades.append(
+                prob
+            )
 
     if len(probabilidades) < MINIMO_CASAS:
         return None
 
+    # MEDIANA:
+    # reduz influência de uma casa muito fora
+    # do padrão do mercado.
     return statistics.median(
         probabilidades
     )
@@ -549,26 +521,34 @@ def calcular_consenso(odds):
 # MELHOR ODD
 # =========================================================
 
-def melhor_odd(odds):
-    if not odds:
-        return None
+def encontrar_melhor_odd(odds):
 
-    validas = [
-        item
-        for item in odds
-        if isinstance(
-            item.get("price"),
-            (int, float)
+    validas = []
+
+    for item in odds:
+
+        odd = item.get(
+            "price"
         )
-        and item.get("price") > 1
-    ]
+
+        if (
+            isinstance(
+                odd,
+                (int, float)
+            )
+            and odd > 1
+        ):
+            validas.append(
+                item
+            )
 
     if not validas:
         return None
 
     return max(
         validas,
-        key=lambda x: x["price"]
+        key=lambda item:
+            item["price"]
     )
 
 
@@ -585,6 +565,7 @@ def calcular_kelly(
         return 0
 
     b = odd - 1
+
     q = 1 - probabilidade
 
     kelly = (
@@ -605,7 +586,7 @@ def calcular_kelly(
 
 
 # =========================================================
-# ANÁLISE EV+
+# ANALISAR EV+
 # =========================================================
 
 def analisar_jogos(jogos):
@@ -625,72 +606,106 @@ def analisar_jogos(jogos):
 
             for chave, odds in mercados.items():
 
+                # Precisamos de pelo menos
+                # 3 casas para formar consenso.
                 if len(odds) < MINIMO_CASAS:
                     continue
 
-                consenso = calcular_consenso(
-                    odds
+                probabilidade = (
+                    calcular_consenso(
+                        odds
+                    )
                 )
 
-                if consenso is None:
+                if probabilidade is None:
                     continue
 
-                melhor = melhor_odd(
+                melhor = encontrar_melhor_odd(
                     odds
                 )
 
                 if melhor is None:
                     continue
 
-                odd = melhor["price"]
+                odd = melhor[
+                    "price"
+                ]
 
+                # EV
                 ev = (
-                    consenso * odd - 1
+                    probabilidade
+                    * odd
+                    - 1
                 ) * 100
 
                 if ev < EV_MINIMO:
                     continue
 
-                fair_odd = (
-                    1 / consenso
-                    if consenso > 0
-                    else 0
+                # Odd justa
+                odd_justa = (
+                    1 / probabilidade
                 )
 
+                # Kelly fracionado
                 stake = calcular_kelly(
-                    consenso,
+                    probabilidade,
                     odd
                 )
 
                 oportunidades.append({
+
                     "jogo": (
                         f"{jogo['home_team']} "
                         f"x "
                         f"{jogo['away_team']}"
                     ),
-                    "data": jogo[
-                        "commence_time"
-                    ],
-                    "mercado": mercado,
-                    "resultado": melhor[
-                        "name"
-                    ],
-                    "point": melhor.get(
-                        "point"
-                    ),
-                    "casa": melhor[
-                        "bookmaker"
-                    ],
-                    "odd": odd,
-                    "probabilidade": consenso,
-                    "fair_odd": fair_odd,
-                    "ev": ev,
-                    "stake": stake,
-                    "casas": len(odds),
+
+                    "data":
+                        jogo[
+                            "commence_time"
+                        ],
+
+                    "mercado":
+                        mercado,
+
+                    "resultado":
+                        melhor[
+                            "name"
+                        ],
+
+                    "point":
+                        melhor.get(
+                            "point"
+                        ),
+
+                    "casa":
+                        melhor[
+                            "bookmaker"
+                        ],
+
+                    "odd":
+                        odd,
+
+                    "probabilidade":
+                        probabilidade,
+
+                    "odd_justa":
+                        odd_justa,
+
+                    "ev":
+                        ev,
+
+                    "stake":
+                        stake,
+
+                    "casas":
+                        len(odds)
                 })
 
+    # Maior EV primeiro
     oportunidades.sort(
-        key=lambda x: x["ev"],
+        key=lambda item:
+            item["ev"],
         reverse=True
     )
 
@@ -698,7 +713,7 @@ def analisar_jogos(jogos):
 
 
 # =========================================================
-# FORMATAÇÃO
+# FORMATAR RESULTADO
 # =========================================================
 
 def formatar_oportunidade(
@@ -706,50 +721,62 @@ def formatar_oportunidade(
     numero
 ):
 
-    data = oportunidade["data"]
+    data = oportunidade[
+        "data"
+    ]
 
     horario = data.strftime(
-        "%d/%m %H:%M"
+        "%d/%m/%Y %H:%M"
     )
 
-    resultado = nome_resultado({
-        "name": oportunidade[
+    resultado = nome_resultado(
+        oportunidade[
             "resultado"
         ]
-    })
+    )
 
     point = oportunidade.get(
         "point"
     )
 
     if point is not None:
-
         resultado = (
             f"{resultado} {point}"
         )
 
-    texto = (
-        f"🔥 OPORTUNIDADE EV+ #{numero}\n\n"
-        f"⚽ {oportunidade['jogo']}\n"
-        f"🕐 {horario}\n"
-        f"📊 Mercado: "
+    return (
+        f"🔥 EV+ #{numero}\n\n"
+
+        f"⚽ JOGO\n"
+        f"{oportunidade['jogo']}\n\n"
+
+        f"🕐 Horário: {horario}\n\n"
+
+        f"🎯 APOSTA\n"
+        f"Mercado: "
         f"{nome_mercado(oportunidade['mercado'])}\n"
-        f"🎯 Entrada: {resultado}\n"
-        f"🏦 Casa: {oportunidade['casa']}\n"
-        f"💰 Odd: {oportunidade['odd']:.2f}\n\n"
-        f"📈 Probabilidade estimada: "
+        f"Entrada: {resultado}\n\n"
+
+        f"🏦 Melhor casa: "
+        f"{oportunidade['casa']}\n"
+        f"💰 Odd: "
+        f"{oportunidade['odd']:.2f}\n\n"
+
+        f"📊 Probabilidade estimada: "
         f"{oportunidade['probabilidade'] * 100:.1f}%\n"
+
         f"📐 Odd justa: "
-        f"{oportunidade['fair_odd']:.2f}\n"
+        f"{oportunidade['odd_justa']:.2f}\n"
+
         f"💎 EV: "
         f"+{oportunidade['ev']:.2f}%\n"
+
         f"🏦 Casas analisadas: "
         f"{oportunidade['casas']}\n"
-        f"💵 Kelly 25%: "
-        f"R$ {oportunidade['stake']:.2f}\n"
-    )
 
-    return texto
+        f"💵 Kelly 25%: "
+        f"R$ {oportunidade['stake']:.2f}"
+    )
 
 
 # =========================================================
@@ -767,14 +794,30 @@ def executar_analise(chat_id):
 
         jogos = coletar_jogos()
 
-        if not jogos:
+        # -------------------------------------------------
+        # IMPORTANTE:
+        # agora informamos quantos jogos foram encontrados.
+        # Assim sabemos se o problema é coleta ou EV.
+        # -------------------------------------------------
+
+        quantidade_jogos = len(
+            jogos
+        )
+
+        if quantidade_jogos == 0:
 
             bot.send_message(
                 chat_id,
-                "❌ Não encontrei jogos disponíveis para amanhã."
+                "❌ Nenhum jogo de amanhã foi encontrado na fonte de odds."
             )
 
             return
+
+        bot.send_message(
+            chat_id,
+            f"⚽ {quantidade_jogos} jogos encontrados. "
+            f"Calculando as oportunidades EV+..."
+        )
 
         oportunidades = analisar_jogos(
             jogos
@@ -784,44 +827,45 @@ def executar_analise(chat_id):
 
             bot.send_message(
                 chat_id,
-                "🔎 Nenhuma oportunidade EV+ encontrada para amanhã dentro dos filtros definidos."
+                "📊 Jogos encontrados, mas nenhuma oportunidade "
+                "EV+ passou pelos filtros atuais."
             )
 
             return
 
         bot.send_message(
             chat_id,
-            f"✅ Encontrei {len(oportunidades)} oportunidades EV+:"
+            f"✅ {len(oportunidades)} oportunidades EV+ encontradas:"
         )
 
-        for i, oportunidade in enumerate(
+        for numero, oportunidade in enumerate(
             oportunidades,
             start=1
         ):
 
-            try:
-
-                bot.send_message(
-                    chat_id,
-                    formatar_oportunidade(
-                        oportunidade,
-                        i
-                    )
+            bot.send_message(
+                chat_id,
+                formatar_oportunidade(
+                    oportunidade,
+                    numero
                 )
+            )
 
-            except Exception:
-                continue
+    except Exception:
 
-    except Exception as erro:
+        try:
 
-        bot.send_message(
-            chat_id,
-            "❌ Ocorreu um erro durante a análise."
-        )
+            bot.send_message(
+                chat_id,
+                "❌ Erro durante a análise."
+            )
+
+        except Exception:
+            pass
 
 
 # =========================================================
-# COMANDO /START
+# /START
 # =========================================================
 
 @bot.message_handler(
@@ -836,14 +880,12 @@ def comando_start(message):
     bot.send_message(
         message.chat.id,
         "🤖 Bot conectado!\n\n"
-        "Comandos disponíveis:\n\n"
-        "📊 /odds - analisar oportunidades EV+ de amanhã\n\n"
-        "O bot analisa odds de diferentes casas disponíveis na fonte de dados."
+        "Use /odds para analisar as oportunidades EV+ de amanhã."
     )
 
 
 # =========================================================
-# COMANDO /ODDS
+# /ODDS
 # =========================================================
 
 @bot.message_handler(
@@ -854,6 +896,11 @@ def comando_odds(message):
     global CHAT_ID
 
     CHAT_ID = message.chat.id
+
+    bot.send_message(
+        message.chat.id,
+        "⏳ Iniciando análise..."
+    )
 
     thread = threading.Thread(
         target=executar_analise,
@@ -875,7 +922,7 @@ def outras_mensagens(message):
 
     bot.send_message(
         message.chat.id,
-        "Use /odds para analisar as oportunidades EV+ de amanhã."
+        "Use /odds para analisar as oportunidades EV+."
     )
 
 
@@ -908,7 +955,7 @@ def agendamento_diario():
 
 
 # =========================================================
-# INICIAR TELEGRAM
+# TELEGRAM
 # =========================================================
 
 def iniciar_bot():
@@ -917,27 +964,19 @@ def iniciar_bot():
 
         try:
 
-            print(
-                "🤖 Iniciando bot do Telegram..."
-            )
-
             bot.infinity_polling(
                 timeout=30,
                 long_polling_timeout=30,
                 skip_pending=True
             )
 
-        except Exception as erro:
-
-            print(
-                f"Erro no Telegram: {erro}"
-            )
+        except Exception:
 
             time.sleep(10)
 
 
 # =========================================================
-# INICIAR
+# INICIALIZAÇÃO
 # =========================================================
 
 if __name__ == "__main__":
