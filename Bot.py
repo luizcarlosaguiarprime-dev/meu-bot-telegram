@@ -228,49 +228,84 @@ def temporada_atual():
 # JOGOS AO VIVO
 # ============================================================
 
+def _formatar_jogo_live(item):
+    """Converte a resposta da API-Football para o formato interno."""
+    fixture = item.get("fixture", {})
+    league = item.get("league", {})
+    teams = item.get("teams", {})
+    goals = item.get("goals", {})
+    status = fixture.get("status", {})
+
+    league_id = safe_int(league.get("id"), 0)
+    status_short = status.get("short")
+
+    if league_id not in LEAGUES or status_short not in LIVE_STATUSES:
+        return None
+
+    return {
+        "id": fixture.get("id"),
+        "timestamp": fixture.get("timestamp"),
+        "minute": safe_int(status.get("elapsed")),
+        "status": status_short,
+        "league_id": league_id,
+        "league": LEAGUES.get(league_id, league.get("name", "")),
+        "home_id": teams.get("home", {}).get("id"),
+        "away_id": teams.get("away", {}).get("id"),
+        "home": teams.get("home", {}).get("name", "Casa"),
+        "away": teams.get("away", {}).get("name", "Fora"),
+        "home_goals": safe_int(goals.get("home")),
+        "away_goals": safe_int(goals.get("away")),
+    }
+
+
 def obter_jogos_ao_vivo():
     """
-    Retorna todos os jogos live disponíveis na API.
-    Depois filtramos pelas ligas configuradas.
+    Busca partidas ao vivo por competição, em vez de depender somente
+    de /fixtures?live=all. Isso torna a consulta mais confiável para
+    ligas específicas, como o Brasileirão.
+
+    Primeiro consultamos cada liga configurada. Se alguma consulta
+    individual falhar, fazemos uma segunda tentativa geral com live=all.
     """
-    dados = api_get("/fixtures", {"live": "all"}, ttl=30)
+    jogos_por_id = {}
 
-    if not dados:
-        return []
+    # Consulta individual por liga. O ID da competição é enviado
+    # explicitamente para evitar perder partidas no filtro posterior.
+    for league_id in LEAGUES:
+        dados = api_get(
+            "/fixtures",
+            {
+                "live": "all",
+                "league": league_id,
+            },
+            ttl=30
+        )
 
-    jogos = []
-
-    for item in dados:
-        fixture = item.get("fixture", {})
-        league = item.get("league", {})
-        teams = item.get("teams", {})
-        goals = item.get("goals", {})
-        status = fixture.get("status", {})
-
-        league_id = league.get("id")
-
-        if league_id not in LEAGUES:
+        if not dados:
             continue
 
-        status_short = status.get("short")
+        for item in dados:
+            jogo = _formatar_jogo_live(item)
+            if jogo and jogo.get("id"):
+                jogos_por_id[jogo["id"]] = jogo
 
-        if status_short not in LIVE_STATUSES:
-            continue
+    # Fallback: consulta geral. É útil quando a API retorna partidas
+    # live no endpoint global, mas não numa consulta individual.
+    if not jogos_por_id:
+        dados = api_get("/fixtures", {"live": "all"}, ttl=20)
 
-        jogos.append({
-            "id": fixture.get("id"),
-            "timestamp": fixture.get("timestamp"),
-            "minute": safe_int(status.get("elapsed")),
-            "status": status_short,
-            "league_id": league_id,
-            "league": LEAGUES.get(league_id, league.get("name", "")),
-            "home_id": teams.get("home", {}).get("id"),
-            "away_id": teams.get("away", {}).get("id"),
-            "home": teams.get("home", {}).get("name", "Casa"),
-            "away": teams.get("away", {}).get("name", "Fora"),
-            "home_goals": safe_int(goals.get("home")),
-            "away_goals": safe_int(goals.get("away")),
-        })
+        for item in (dados or []):
+            jogo = _formatar_jogo_live(item)
+            if jogo and jogo.get("id"):
+                jogos_por_id[jogo["id"]] = jogo
+
+    jogos = list(jogos_por_id.values())
+    jogos.sort(key=lambda x: (x["league_id"], x["home"], x["away"]))
+
+    print(
+        "Live: %d jogo(s) encontrado(s) nas ligas configuradas."
+        % len(jogos)
+    )
 
     return jogos
 
