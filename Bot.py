@@ -1,11 +1,8 @@
 import os
-import re
 import time
-import unicodedata
 import threading
 import requests
 import telebot
-from difflib import SequenceMatcher
 from flask import Flask
 
 # ============================================================
@@ -13,592 +10,509 @@ from flask import Flask
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
-SEGUNDA_API_KEY = os.getenv("SEGUNDA_API_KEY")
 
-_FALTANDO = [
-    nome for nome, valor in [
-        ("BOT_TOKEN", BOT_TOKEN),
-        ("RAPIDAPI_KEY", RAPIDAPI_KEY),
-        ("SEGUNDA_API_KEY", SEGUNDA_API_KEY),
-    ]
-    if not valor
-]
+# Chave já cadastrada no Render
+API_FOOTBALL_KEY = (
+    os.getenv("API_FOOTBALL_KEY")
+    or os.getenv("API_SPORTS_KEY")
+    or os.getenv("APISPORTS_KEY")
+)
 
-if _FALTANDO:
+API_BASE = "https://v3.football.api-sports.io"
+
+HEADERS = {
+    "x-apisports-key": API_FOOTBALL_KEY
+}
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN não configurado no Render.")
+
+if not API_FOOTBALL_KEY:
     raise RuntimeError(
-        "Variáveis de ambiente faltando: " + ", ".join(_FALTANDO) +
-        ". Configure-as no Render (Settings > Environment) antes de iniciar o bot."
+        "API_FOOTBALL_KEY não configurada no Render."
     )
 
-bot = telebot.TeleBot(BOT_TOKEN)
-
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 app = Flask(__name__)
 
-CHAT_ID = None
+# ============================================================
+# CONFIGURAÇÕES DAS COMPETIÇÕES
+# ============================================================
+
+LIGAS = {
+    39: "Premier League",
+    140: "La Liga",
+    78: "Bundesliga",
+    135: "Serie A",
+    61: "Ligue 1",
+    2: "Champions League",
+    3: "Europa League",
+    848: "Conference League",
+    71: "Brasileirão Série A",
+    13: "Copa Libertadores",
+    11: "Copa Sul-Americana",
+}
+
+# ============================================================
+# CONTROLE
+# ============================================================
+
 BOT_ATIVO = True
 
-# ============================================================
-# COMPETIÇÕES DE INTERESSE
-# ============================================================
-
-LIGAS = [
-    "brasileirao",
-    "brasileiro",
-    "premier league",
-    "la liga",
-    "bundesliga",
-    "serie a",
-    "ligue 1",
-    "champions league",
-    "uefa champions",
-    "europa league",
-    "conference league",
-    "libertadores",
-    "sudamericana",
-    "copa sudamericana",
-]
-
-# ============================================================
-# SPORTAPI7
-# ============================================================
-
-SPORT_HOST = "sportapi7.p.rapidapi.com"
-
-SPORT_HEADERS = {
-    "x-rapidapi-key": RAPIDAPI_KEY,
-    "x-rapidapi-host": SPORT_HOST
-}
-
-SPORT_BASE = "https://" + SPORT_HOST
+# Limite simples para evitar excesso de chamadas
+CHAMADAS = []
+LIMITE_CHAMADAS = 9
+JANELA_SEGUNDOS = 60
 
 
 # ============================================================
-# SEGUNDA API
+# CONTROLE DE REQUISIÇÕES
 # ============================================================
 
-SEGUNDA_HOST = "free-api-live-football-data.p.rapidapi.com"
+def pode_consultar():
+    agora = time.time()
 
-SEGUNDA_HEADERS = {
-    "x-rapidapi-key": SEGUNDA_API_KEY,
-    "x-rapidapi-host": SEGUNDA_HOST
-}
+    while CHAMADAS and agora - CHAMADAS[0] > JANELA_SEGUNDOS:
+        CHAMADAS.pop(0)
 
-SEGUNDA_BASE = "https://" + SEGUNDA_HOST
+    if len(CHAMADAS) >= LIMITE_CHAMADAS:
+        return False
+
+    CHAMADAS.append(agora)
+    return True
+
+
+def api_get(endpoint, params=None):
+    if not pode_consultar():
+        return None, "Limite temporário de consultas atingido."
+
+    try:
+        resposta = requests.get(
+            API_BASE + endpoint,
+            headers=HEADERS,
+            params=params,
+            timeout=20
+        )
+
+        if resposta.status_code != 200:
+            return None, (
+                f"API retornou HTTP {resposta.status_code}: "
+                f"{resposta.text[:300]}"
+            )
+
+        dados = resposta.json()
+
+        erros = dados.get("errors")
+
+        if erros:
+            return None, f"Erro API: {erros}"
+
+        return dados, None
+
+    except requests.exceptions.Timeout:
+        return None, "Tempo limite da API excedido."
+
+    except requests.exceptions.RequestException as e:
+        return None, f"Erro de conexão: {e}"
+
+    except Exception as e:
+        return None, f"Erro inesperado: {e}"
 
 
 # ============================================================
 # FUNÇÕES AUXILIARES
 # ============================================================
 
-def texto_seguro(valor):
-    if valor is None:
-        return ""
-    return str(valor).lower().strip()
+def valor_statisticas(lista, nome):
+    for item in lista or []:
+        if item.get("type") == nome:
+            valor = item.get("value")
+
+            if valor is None:
+                return 0
+
+            if isinstance(valor, str):
+                valor = valor.replace("%", "").strip()
+
+            try:
+                return float(valor)
+            except:
+                return 0
+
+    return 0
 
 
-def safe_get(d, chave, default=None):
-    """Como dict.get, mas também protege contra valor explicitamente None
-    (dict.get sozinho só usa o default quando a CHAVE não existe)."""
-    if not isinstance(d, dict):
-        return default
-    valor = d.get(chave, default)
-    return default if valor is None else valor
+def inteiro(valor):
+    try:
+        return int(float(valor))
+    except:
+        return 0
 
 
-def pertence_as_ligas(nome):
-    nome = texto_seguro(nome)
-
-    if not nome:
-        return False
-
-    for liga in LIGAS:
-        if liga in nome:
-            return True
-
-    return False
+def percentual(valor):
+    try:
+        return f"{float(valor):.0f}%"
+    except:
+        return "0%"
 
 
-def nome_jogo(jogo):
-    home = safe_get(jogo, "home", {})
-    away = safe_get(jogo, "away", {})
+def nome_liga(fixture):
+    liga = fixture.get("league", {})
+    league_id = liga.get("id")
 
     return (
-        safe_get(home, "name", "Casa"),
-        safe_get(away, "name", "Fora")
+        LIGAS.get(league_id)
+        or liga.get("name")
+        or "Competição"
     )
 
 
-def normalizar_nome_time(nome):
-    """Remove acentos, sufixos comuns (FC, SC...) e pontuação para
-    facilitar a comparação de nomes de times entre as duas APIs."""
+def horario_jogo(fixture):
+    data = fixture.get("fixture", {}).get("date", "")
 
-    if not nome:
-        return ""
-
-    nome = unicodedata.normalize("NFKD", nome)
-    nome = "".join(c for c in nome if not unicodedata.combining(c))
-    nome = nome.lower()
-
-    for sufixo in [" fc", " sc", " cf", " afc", " ac", " sap"]:
-        if nome.endswith(sufixo):
-            nome = nome[: -len(sufixo)]
-
-    nome = re.sub(r"[^a-z0-9 ]", "", nome)
-
-    return nome.strip()
-
-
-def similaridade(a, b):
-    if not a or not b:
-        return 0.0
-    return SequenceMatcher(None, a, b).ratio()
-
-
-# ============================================================
-# SEGUNDA API — JOGOS AO VIVO
-# ============================================================
-
-def buscar_segunda_api_live():
-
-    url = SEGUNDA_BASE + "/football-live"
+    if not data:
+        return "Horário não informado"
 
     try:
+        # A API está sendo chamada com timezone de São Paulo.
+        return data.replace("T", " ")[:16]
+    except:
+        return data
 
-        resposta = requests.get(
-            url,
-            headers=SEGUNDA_HEADERS,
-            timeout=15
-        )
 
-        if resposta.status_code == 429:
-            print("SEGUNDA API: limite de requisições atingido")
-            return []
+def minuto_jogo(fixture):
+    elapsed = (
+        fixture
+        .get("fixture", {})
+        .get("status", {})
+        .get("elapsed")
+    )
 
-        print("SEGUNDA API STATUS:", resposta.status_code)
+    return elapsed or 0
 
-        if resposta.status_code != 200:
-            print("SEGUNDA API ERRO:", resposta.text[:500])
-            return []
 
-        dados = resposta.json()
-
-        if dados.get("status") != "success":
-            return []
-
-        response = safe_get(dados, "response", {})
-
-        jogos = safe_get(response, "live", [])
-
-        print("SEGUNDA API JOGOS:", len(jogos))
-
-        return jogos
-
-    except Exception as e:
-        print("ERRO SEGUNDA API:", e)
-        return []
+def status_jogo(fixture):
+    return (
+        fixture
+        .get("fixture", {})
+        .get("status", {})
+        .get("long")
+        or "Ao vivo"
+    )
 
 
 # ============================================================
-# SPORTAPI7 — JOGOS AO VIVO (para cruzamento por nome de time)
+# BUSCAR JOGOS AO VIVO
 # ============================================================
 
-def buscar_eventos_sportapi_live():
+def buscar_jogos_ao_vivo():
+    dados, erro = api_get(
+        "/fixtures",
+        {
+            "live": "all",
+            "timezone": "America/Sao_Paulo"
+        }
+    )
 
-    url = f"{SPORT_BASE}/api/v1/sport/football/events/live"
+    if erro:
+        return [], erro
 
-    try:
+    fixtures = dados.get("response", [])
 
-        resposta = requests.get(
-            url,
-            headers=SPORT_HEADERS,
-            timeout=15
-        )
+    jogos = []
 
-        if resposta.status_code == 429:
-            print("SPORTAPI7: limite de requisições atingido")
-            return []
+    for fixture in fixtures:
 
-        if resposta.status_code != 200:
-            print("SPORTAPI7 EVENTS STATUS:", resposta.status_code, resposta.text[:300])
-            return []
+        league_id = fixture.get("league", {}).get("id")
 
-        dados = resposta.json()
+        if league_id in LIGAS:
+            jogos.append(fixture)
 
-        eventos = safe_get(dados, "events", [])
-
-        print("SPORTAPI7 EVENTOS AO VIVO:", len(eventos))
-
-        return eventos
-
-    except Exception as e:
-        print("ERRO SPORTAPI7 EVENTS:", e)
-        return []
-
-
-def encontrar_evento_sportapi(jogo_segunda, eventos_sportapi):
-    """Cruza um jogo da Segunda API com a lista de eventos ao vivo da
-    SportAPI7 comparando os nomes dos times (os IDs das duas APIs NÃO
-    são compatíveis entre si, então não dá pra cruzar por ID)."""
-
-    home_seg, away_seg = nome_jogo(jogo_segunda)
-    home_seg = normalizar_nome_time(home_seg)
-    away_seg = normalizar_nome_time(away_seg)
-
-    melhor_evento = None
-    melhor_pontuacao = 0.0
-
-    for evento in eventos_sportapi:
-
-        home_evt = normalizar_nome_time(
-            safe_get(safe_get(evento, "homeTeam", {}), "name", "")
-        )
-        away_evt = normalizar_nome_time(
-            safe_get(safe_get(evento, "awayTeam", {}), "name", "")
-        )
-
-        pontuacao = similaridade(home_seg, home_evt) + similaridade(away_seg, away_evt)
-
-        if pontuacao > melhor_pontuacao:
-            melhor_pontuacao = pontuacao
-            melhor_evento = evento
-
-    # soma de duas similaridades (0 a 2) — exige boa confiança nos dois nomes
-    LIMIAR_CONFIANCA = 1.5
-
-    if melhor_evento and melhor_pontuacao >= LIMIAR_CONFIANCA:
-        return melhor_evento
-
-    return None
+    return jogos, None
 
 
 # ============================================================
-# SPORTAPI7 — ESTATÍSTICAS
+# BUSCAR DADOS DO JOGO
 # ============================================================
 
-def buscar_estatisticas(event_id):
+def buscar_estatisticas(fixture_id):
+    dados, erro = api_get(
+        "/fixtures/statistics",
+        {
+            "fixture": fixture_id
+        }
+    )
 
-    if not event_id:
-        return {}
+    if erro:
+        return [], erro
 
-    url = f"{SPORT_BASE}/api/v1/event/{event_id}/statistics"
-
-    try:
-
-        resposta = requests.get(
-            url,
-            headers=SPORT_HEADERS,
-            timeout=15
-        )
-
-        if resposta.status_code == 429:
-            print("SPORTAPI7: limite de requisições atingido (statistics)")
-            return {}
-
-        if resposta.status_code != 200:
-            print(
-                "STAT STATUS:",
-                resposta.status_code,
-                resposta.text[:200]
-            )
-            return {}
-
-        return resposta.json()
-
-    except Exception as e:
-        print("ERRO ESTATISTICAS:", e)
-        return {}
+    return dados.get("response", []), None
 
 
-# ============================================================
-# EXTRAIR NÚMEROS DAS ESTATÍSTICAS
-# ============================================================
+def buscar_fixture(fixture_id):
+    dados, erro = api_get(
+        "/fixtures",
+        {
+            "id": fixture_id,
+            "timezone": "America/Sao_Paulo"
+        }
+    )
 
-def encontrar_numero(obj, palavras):
+    if erro:
+        return None, erro
 
-    if isinstance(obj, dict):
+    resposta = dados.get("response", [])
 
-        for chave, valor in obj.items():
+    if not resposta:
+        return None, "Jogo não encontrado."
 
-            chave_txt = texto_seguro(chave)
-
-            if any(p in chave_txt for p in palavras):
-
-                if isinstance(valor, (int, float)):
-                    return float(valor)
-
-                if isinstance(valor, str):
-
-                    valor_limpo = (
-                        valor.replace("%", "")
-                        .replace(",", ".")
-                    )
-
-                    try:
-                        return float(valor_limpo)
-                    except ValueError:
-                        pass
-
-            resultado = encontrar_numero(valor, palavras)
-
-            if resultado is not None:
-                return resultado
-
-    elif isinstance(obj, list):
-
-        for item in obj:
-
-            resultado = encontrar_numero(item, palavras)
-
-            if resultado is not None:
-                return resultado
-
-    return None
+    return resposta[0], None
 
 
 # ============================================================
-# ANALISAR PRESSÃO
+# PRESSÃO
 # ============================================================
 
 def calcular_pressao(estatisticas):
+    if not estatisticas or len(estatisticas) < 2:
+        return None
 
-    posse = encontrar_numero(estatisticas, ["ball possession", "possession"])
-    finalizacoes = encontrar_numero(estatisticas, ["shots", "total shots"])
-    no_alvo = encontrar_numero(estatisticas, ["shots on target", "on target"])
-    escanteios = encontrar_numero(estatisticas, ["corner"])
-    ataques_perigosos = encontrar_numero(estatisticas, ["dangerous attack"])
+    casa = estatisticas[0]
+    fora = estatisticas[1]
 
-    pontos = 0
+    def extrair(equipe):
+        return {
+            "posse": valor_statisticas(
+                equipe.get("statistics"), "Ball Possession"
+            ),
+            "finalizacoes": valor_statisticas(
+                equipe.get("statistics"), "Total Shots"
+            ),
+            "finalizacoes_alvo": valor_statisticas(
+                equipe.get("statistics"), "Shots on Goal"
+            ),
+            "escanteios": valor_statisticas(
+                equipe.get("statistics"), "Corner Kicks"
+            ),
+            "ataques_perigosos": valor_statisticas(
+                equipe.get("statistics"), "Dangerous Attacks"
+            ),
+            "cartoes": valor_statisticas(
+                equipe.get("statistics"), "Yellow Cards"
+            ),
+        }
 
-    if posse is not None:
-        if posse >= 60:
-            pontos += 25
-        elif posse >= 55:
-            pontos += 15
+    c = extrair(casa)
+    f = extrair(fora)
 
-    if finalizacoes is not None:
-        if finalizacoes >= 10:
-            pontos += 20
-        elif finalizacoes >= 7:
-            pontos += 12
+    # Pontuação relativa.
+    # Serve para indicar domínio/pressão, não é uma probabilidade
+    # de vitória.
+    peso = {
+        "posse": 0.10,
+        "finalizacoes": 0.20,
+        "finalizacoes_alvo": 0.30,
+        "escanteios": 0.15,
+        "ataques_perigosos": 0.25,
+    }
 
-    if no_alvo is not None:
-        if no_alvo >= 4:
-            pontos += 25
-        elif no_alvo >= 2:
-            pontos += 15
+    def pontuacao(dados):
+        return (
+            dados["posse"] * peso["posse"]
+            + dados["finalizacoes"] * peso["finalizacoes"]
+            + dados["finalizacoes_alvo"] * peso["finalizacoes_alvo"]
+            + dados["escanteios"] * peso["escanteios"]
+            + dados["ataques_perigosos"] * peso["ataques_perigosos"]
+        )
 
-    if escanteios is not None:
-        if escanteios >= 6:
-            pontos += 15
-        elif escanteios >= 4:
-            pontos += 8
+    score_casa = pontuacao(c)
+    score_fora = pontuacao(f)
 
-    if ataques_perigosos is not None:
-        if ataques_perigosos >= 40:
-            pontos += 15
-        elif ataques_perigosos >= 25:
-            pontos += 8
+    total = score_casa + score_fora
 
-    return min(pontos, 100)
+    if total > 0:
+        dominio_casa = (score_casa / total) * 100
+        dominio_fora = (score_fora / total) * 100
+    else:
+        dominio_casa = 50
+        dominio_fora = 50
+
+    return {
+        "casa": c,
+        "fora": f,
+        "score_casa": score_casa,
+        "score_fora": score_fora,
+        "dominio_casa": dominio_casa,
+        "dominio_fora": dominio_fora,
+    }
 
 
 # ============================================================
-# GERAR ANÁLISE
+# ANÁLISE DO JOGO
 # ============================================================
 
-def gerar_analise(jogo, estatisticas):
+def analisar_jogo(fixture):
+    fixture_data = fixture.get("fixture", {})
+    teams = fixture.get("teams", {})
+    goals = fixture.get("goals", {})
 
-    home = safe_get(jogo, "home", {})
-    away = safe_get(jogo, "away", {})
+    fixture_id = fixture_data.get("id")
 
-    home_nome = safe_get(home, "name", "Casa")
-    away_nome = safe_get(away, "name", "Fora")
+    casa = teams.get("home", {}).get("name", "Casa")
+    fora = teams.get("away", {}).get("name", "Fora")
 
-    placar_home = safe_get(home, "score", 0)
-    placar_away = safe_get(away, "score", 0)
+    gols_casa = goals.get("home")
+    gols_fora = goals.get("away")
 
-    status = safe_get(jogo, "status", {})
-    live_time = safe_get(status, "liveTime", {})
-    minuto = safe_get(live_time, "short", "")
+    estatisticas, erro = buscar_estatisticas(fixture_id)
 
     pressao = calcular_pressao(estatisticas)
 
-    linhas = []
+    mensagem = []
 
-    linhas.append(f"⚽ <b>{home_nome} x {away_nome}</b>")
-    linhas.append(f"🆔 ID (use em /analisar): <code>{jogo.get('id')}</code>")
-    linhas.append(f"📊 Placar: <b>{placar_home} x {placar_away}</b>")
+    mensagem.append(
+        f"⚽ <b>{casa} x {fora}</b>"
+    )
 
-    if minuto:
-        linhas.append(f"⏱️ Tempo: <b>{minuto}</b>")
+    mensagem.append(
+        f"🏆 {nome_liga(fixture)}"
+    )
 
-    if not estatisticas:
-        linhas.append("⚠️ Estatísticas indisponíveis para esta partida.")
+    mensagem.append(
+        f"🕐 {horario_jogo(fixture)}"
+    )
 
-    linhas.append(f"🔥 Pressão estatística: <b>{pressao}/100</b>")
+    mensagem.append(
+        f"⏱️ {minuto_jogo(fixture)}' — {status_jogo(fixture)}"
+    )
 
-    if pressao >= 75:
-        linhas.append("🔴 <b>PRESSÃO MUITO ALTA</b>")
-        linhas.append("📌 Há sinais estatísticos fortes de domínio.")
-        linhas.append(
-            "🎯 <b>ENTRADA SUGERIDA:</b> analisar mercado "
-            "relacionado ao time dominante ou próximo gol."
+    mensagem.append(
+        f"📊 Placar: <b>{gols_casa or 0} x {gols_fora or 0}</b>"
+    )
+
+    mensagem.append("")
+
+    if erro:
+        mensagem.append(
+            f"⚠️ Não foi possível carregar as estatísticas: {erro}"
         )
 
-    elif pressao >= 60:
-        linhas.append("🟠 <b>PRESSÃO ALTA</b>")
-        linhas.append("📌 O jogo apresenta sinais de pressão.")
-        linhas.append(
-            "🎯 <b>ENTRADA SUGERIDA:</b> aguardar confirmação "
-            "antes de entrar."
+        return "\n".join(mensagem)
+
+    if not pressao:
+        mensagem.append(
+            "📊 Estatísticas detalhadas ainda não disponíveis."
+        )
+
+        return "\n".join(mensagem)
+
+    c = pressao["casa"]
+    f = pressao["fora"]
+
+    mensagem.append("📈 <b>ESTATÍSTICAS AO VIVO</b>")
+
+    mensagem.append(
+        f"Possession: {percentual(c['posse'])} x "
+        f"{percentual(f['posse'])}"
+    )
+
+    mensagem.append(
+        f"Finalizações: {inteiro(c['finalizacoes'])} x "
+        f"{inteiro(f['finalizacoes'])}"
+    )
+
+    mensagem.append(
+        f"No alvo: {inteiro(c['finalizacoes_alvo'])} x "
+        f"{inteiro(f['finalizacoes_alvo'])}"
+    )
+
+    mensagem.append(
+        f"Escanteios: {inteiro(c['escanteios'])} x "
+        f"{inteiro(f['escanteios'])}"
+    )
+
+    mensagem.append(
+        f"Ataques perigosos: "
+        f"{inteiro(c['ataques_perigosos'])} x "
+        f"{inteiro(f['ataques_perigosos'])}"
+    )
+
+    mensagem.append("")
+
+    mensagem.append("🔥 <b>PRESSÃO RELATIVA</b>")
+
+    mensagem.append(
+        f"{casa}: {pressao['dominio_casa']:.0f}%"
+    )
+
+    mensagem.append(
+        f"{fora}: {pressao['dominio_fora']:.0f}%"
+    )
+
+    diferenca = abs(
+        pressao["dominio_casa"]
+        - pressao["dominio_fora"]
+    )
+
+    if diferenca >= 30:
+        if pressao["dominio_casa"] > pressao["dominio_fora"]:
+            dominante = casa
+        else:
+            dominante = fora
+
+        mensagem.append(
+            f"🔴 <b>Pressão forte:</b> {dominante}"
+        )
+
+    elif diferenca >= 15:
+        if pressao["dominio_casa"] > pressao["dominio_fora"]:
+            dominante = casa
+        else:
+            dominante = fora
+
+        mensagem.append(
+            f"🟠 <b>Pressão moderada:</b> {dominante}"
         )
 
     else:
-        linhas.append("🟢 <b>SEM PRESSÃO SUFICIENTE</b>")
-        linhas.append("⏳ <b>SEM ENTRADA — aguardar mais dados.</b>")
-
-    linhas.append("")
-    linhas.append("⚠️ Análise estatística. Não é garantia de lucro.")
-
-    return "\n".join(linhas), pressao
-
-
-# ============================================================
-# /LIVE
-# ============================================================
-
-@bot.message_handler(commands=["live"])
-def comando_live(message):
-
-    if not BOT_ATIVO:
-        bot.send_message(message.chat.id, "⏸️ Bot pausado. Use /ativar para retomar.")
-        return
-
-    bot.send_message(message.chat.id, "🔎 Buscando jogos ao vivo...")
-
-    jogos_segunda = buscar_segunda_api_live()
-
-    if not jogos_segunda:
-        bot.send_message(message.chat.id, "❌ Nenhum jogo ao vivo encontrado.")
-        return
-
-    eventos_sportapi = buscar_eventos_sportapi_live()
-
-    enviados = 0
-    sem_correspondencia = 0
-
-    for jogo in jogos_segunda:
-
-        evento_sport = encontrar_evento_sportapi(jogo, eventos_sportapi)
-
-        if not evento_sport:
-            sem_correspondencia += 1
-            continue
-
-        torneio = safe_get(evento_sport, "tournament", {})
-        nome_liga = (
-            safe_get(torneio, "name", "")
-            or safe_get(safe_get(torneio, "uniqueTournament", {}), "name", "")
+        mensagem.append(
+            "🟡 <b>Jogo equilibrado</b>"
         )
 
-        if not pertence_as_ligas(nome_liga):
-            continue
+    mensagem.append("")
 
-        event_id = evento_sport.get("id")
+    mensagem.append(
+        "ℹ️ Análise estatística ao vivo. "
+        "Não é garantia de resultado."
+    )
 
-        estatisticas = buscar_estatisticas(event_id)
-        time.sleep(0.3)  # evita estourar limite de requisições da RapidAPI
-
-        texto, pressao = gerar_analise(jogo, estatisticas)
-
-        bot.send_message(message.chat.id, texto, parse_mode="HTML")
-
-        enviados += 1
-
-        if enviados >= 20:
-            break
-
-    if enviados == 0:
-        bot.send_message(
-            message.chat.id,
-            "ℹ️ Nenhum jogo das ligas monitoradas foi confirmado agora.\n"
-            f"({sem_correspondencia} jogo(s) ao vivo não puderam ser cruzados "
-            "entre as duas APIs pelos nomes dos times.)"
-        )
+    return "\n".join(mensagem)
 
 
 # ============================================================
-# /ANALISAR ID
+# TELEGRAM — /START
 # ============================================================
 
-@bot.message_handler(commands=["analisar"])
-def comando_analisar(message):
+@bot.message_handler(commands=["start"])
+def start(message):
 
-    if not BOT_ATIVO:
-        bot.send_message(message.chat.id, "⏸️ Bot pausado. Use /ativar para retomar.")
-        return
+    texto = (
+        "🤖 <b>BOT DE ANÁLISE DE FUTEBOL</b>\n\n"
+        "🟢 Bot conectado.\n\n"
+        "📡 Fonte de dados: API-Sports / API-Football\n\n"
+        "Comandos disponíveis:\n\n"
+        "⚽ /live — Jogos ao vivo\n"
+        "🔎 /analisar ID — Analisar um jogo\n"
+        "📡 /status — Ver conexão\n"
+        "⏸️ /pausar — Pausar bot\n"
+        "▶️ /ativar — Ativar bot\n\n"
+        "A análise considera estatísticas "
+        "e pressão do jogo em tempo real.\n\n"
+        "ℹ️ As análises são informativas e "
+        "não garantem resultados."
+    )
 
-    partes = message.text.split()
-
-    if len(partes) < 2:
-        bot.send_message(
-            message.chat.id,
-            "Use assim:\n\n/analisar ID_DO_JOGO\n\n(o ID aparece em cada jogo listado por /live)"
-        )
-        return
-
-    try:
-        event_id = int(partes[1])
-    except ValueError:
-        bot.send_message(message.chat.id, "❌ ID inválido.")
-        return
-
-    bot.send_message(message.chat.id, "🔎 Analisando partida...")
-
-    jogos = buscar_segunda_api_live()
-
-    jogo = next((item for item in jogos if item.get("id") == event_id), None)
-
-    if not jogo:
-        bot.send_message(message.chat.id, "❌ Essa partida não está na lista de jogos ao vivo.")
-        return
-
-    eventos_sportapi = buscar_eventos_sportapi_live()
-    evento_sport = encontrar_evento_sportapi(jogo, eventos_sportapi)
-
-    estatisticas = {}
-
-    if evento_sport:
-        estatisticas = buscar_estatisticas(evento_sport.get("id"))
-    else:
-        bot.send_message(
-            message.chat.id,
-            "⚠️ Não consegui cruzar essa partida com a SportAPI7 — a análise "
-            "será feita apenas com os dados básicos, sem estatísticas."
-        )
-
-    texto, pressao = gerar_analise(jogo, estatisticas)
-
-    bot.send_message(message.chat.id, texto, parse_mode="HTML")
-
-
-# ============================================================
-# /PAUSAR e /ATIVAR
-# ============================================================
-
-@bot.message_handler(commands=["pausar"])
-def comando_pausar(message):
-    global BOT_ATIVO
-    BOT_ATIVO = False
-    bot.send_message(message.chat.id, "⏸️ Bot pausado. Use /ativar para retomar.")
-
-
-@bot.message_handler(commands=["ativar"])
-def comando_ativar(message):
-    global BOT_ATIVO
-    BOT_ATIVO = True
-    bot.send_message(message.chat.id, "▶️ Bot reativado.")
+    bot.reply_to(message, texto)
 
 
 # ============================================================
@@ -606,77 +520,228 @@ def comando_ativar(message):
 # ============================================================
 
 @bot.message_handler(commands=["status"])
-def comando_status(message):
+def status(message):
 
-    status_segunda = "🟢 OK"
-    status_sport = "🟢 OK"
+    dados, erro = api_get(
+        "/status"
+    )
 
-    try:
-        r = requests.get(SEGUNDA_BASE + "/football-live", headers=SEGUNDA_HEADERS, timeout=10)
-        if r.status_code != 200:
-            status_segunda = f"🔴 erro {r.status_code}"
-    except Exception:
-        status_segunda = "🔴 sem resposta"
-
-    try:
-        r = requests.get(
-            SPORT_BASE + "/api/v1/sport/football/events/live",
-            headers=SPORT_HEADERS,
-            timeout=10
+    if erro:
+        bot.reply_to(
+            message,
+            f"🔴 <b>API OFFLINE</b>\n\n{erro}"
         )
-        if r.status_code != 200:
-            status_sport = f"🔴 erro {r.status_code}"
-    except Exception:
-        status_sport = "🔴 sem resposta"
+        return
 
-    estado_bot = "🟢 ativo" if BOT_ATIVO else "⏸️ pausado"
-
-    bot.send_message(
-        message.chat.id,
-        "🤖 <b>STATUS DO BOT</b>\n\n"
-        f"{status_sport} SportAPI7\n"
-        f"{status_segunda} Segunda API\n"
-        f"Bot: {estado_bot}\n"
-        "📊 Análise: estatística ao vivo (cruzada entre as duas APIs por nome de time)\n"
-        "❌ EV/Kelly: desativados",
-        parse_mode="HTML"
+    bot.reply_to(
+        message,
+        "🟢 <b>SISTEMA ONLINE</b>\n\n"
+        "Telegram: conectado ✅\n"
+        "API-Sports: conectada ✅\n"
+        "Render: ativo ✅\n\n"
+        f"Bot ativo: {'SIM' if BOT_ATIVO else 'NÃO'}"
     )
 
 
 # ============================================================
-# /START
+# /LIVE
 # ============================================================
 
-@bot.message_handler(commands=["start"])
-def comando_start(message):
+@bot.message_handler(commands=["live"])
+def live(message):
 
-    global CHAT_ID
-
-    CHAT_ID = message.chat.id
+    if not BOT_ATIVO:
+        bot.reply_to(
+            message,
+            "⏸️ O bot está pausado.\n"
+            "Use /ativar para ativá-lo."
+        )
+        return
 
     bot.send_message(
         message.chat.id,
-        "🤖 <b>BOT ATIVADO</b>\n\n"
-        "⚽ Análise de futebol ao vivo\n"
-        "📊 Cruzamento de duas fontes de dados (por nome de time)\n"
-        "🔥 Pressão, finalizações, posse e escanteios\n\n"
-        "Comandos:\n"
-        "/live — jogos ao vivo\n"
-        "/analisar ID — analisar partida\n"
-        "/status — verificar conexão\n"
-        "/pausar — pausar o bot\n"
-        "/ativar — reativar o bot",
-        parse_mode="HTML"
+        "🔎 <b>Buscando jogos ao vivo...</b>"
+    )
+
+    jogos, erro = buscar_jogos_ao_vivo()
+
+    if erro:
+        bot.send_message(
+            message.chat.id,
+            f"🔴 Erro ao consultar API:\n{erro}"
+        )
+        return
+
+    if not jogos:
+        bot.send_message(
+            message.chat.id,
+            "⚽ Nenhum jogo ao vivo encontrado "
+            "nas competições configuradas."
+        )
+        return
+
+    texto = "🔴 <b>JOGOS AO VIVO</b>\n\n"
+
+    for jogo in jogos:
+
+        fixture_id = jogo.get("fixture", {}).get("id")
+
+        casa = (
+            jogo.get("teams", {})
+            .get("home", {})
+            .get("name", "Casa")
+        )
+
+        fora = (
+            jogo.get("teams", {})
+            .get("away", {})
+            .get("name", "Fora")
+        )
+
+        gols_casa = jogo.get("goals", {}).get("home") or 0
+        gols_fora = jogo.get("goals", {}).get("away") or 0
+
+        minuto = minuto_jogo(jogo)
+
+        texto += (
+            f"⚽ <b>{casa} x {fora}</b>\n"
+            f"🏆 {nome_liga(jogo)}\n"
+            f"📊 {gols_casa} x {gols_fora}\n"
+            f"⏱️ {minuto}'\n"
+            f"🆔 <code>{fixture_id}</code>\n\n"
+        )
+
+    texto += (
+        "👉 Use <code>/analisar ID</code> "
+        "para analisar um jogo."
+    )
+
+    bot.send_message(
+        message.chat.id,
+        texto
     )
 
 
 # ============================================================
-# FLASK
+# /ANALISAR ID
+# ============================================================
+
+@bot.message_handler(commands=["analisar"])
+def analisar(message):
+
+    partes = message.text.split()
+
+    if len(partes) < 2:
+        bot.reply_to(
+            message,
+            "Use assim:\n\n"
+            "<code>/analisar 123456</code>"
+        )
+        return
+
+    try:
+        fixture_id = int(partes[1])
+    except:
+        bot.reply_to(
+            message,
+            "❌ O ID do jogo precisa ser numérico."
+        )
+        return
+
+    bot.send_message(
+        message.chat.id,
+        "🔎 <b>Analisando jogo...</b>"
+    )
+
+    fixture, erro = buscar_fixture(fixture_id)
+
+    if erro:
+        bot.send_message(
+            message.chat.id,
+            f"🔴 {erro}"
+        )
+        return
+
+    resultado = analisar_jogo(fixture)
+
+    bot.send_message(
+        message.chat.id,
+        resultado
+    )
+
+
+# ============================================================
+# /PAUSAR
+# ============================================================
+
+@bot.message_handler(commands=["pausar"])
+def pausar(message):
+
+    global BOT_ATIVO
+
+    BOT_ATIVO = False
+
+    bot.reply_to(
+        message,
+        "⏸️ <b>Bot pausado.</b>\n\n"
+        "Use /ativar para ativar novamente."
+    )
+
+
+# ============================================================
+# /ATIVAR
+# ============================================================
+
+@bot.message_handler(commands=["ativar"])
+def ativar(message):
+
+    global BOT_ATIVO
+
+    BOT_ATIVO = True
+
+    bot.reply_to(
+        message,
+        "▶️ <b>Bot ativado novamente.</b>"
+    )
+
+
+# ============================================================
+# FLASK / RENDER
 # ============================================================
 
 @app.route("/")
 def home():
-    return "Bot funcionando!"
+
+    return (
+        "Bot funcionando! "
+        "API-Sports/API-Football conectado."
+    )
+
+
+@app.route("/health")
+def health():
+
+    return {
+        "status": "online",
+        "bot_ativo": BOT_ATIVO,
+        "api": "API-Sports/API-Football"
+    }
+
+
+# ============================================================
+# SERVIDOR WEB
+# ============================================================
+
+def iniciar_servidor():
+
+    porta = int(
+        os.environ.get("PORT", 10000)
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=porta
+    )
 
 
 # ============================================================
@@ -685,18 +750,27 @@ def home():
 
 def iniciar_bot():
 
-    print("BOT TELEGRAM INICIANDO...")
-
     while True:
+
         try:
+            print("🤖 Iniciando Telegram...")
+
             bot.remove_webhook()
+
             time.sleep(2)
-            bot.infinity_polling(timeout=30, long_polling_timeout=30)
+
+            bot.infinity_polling(
+                timeout=30,
+                long_polling_timeout=30
+            )
+
         except Exception as e:
-            print("ERRO TELEGRAM:", e)
+
+            print(
+                f"❌ Erro no Telegram: {e}"
+            )
+
             time.sleep(10)
-        # infinity_polling só retorna em erro fatal de conexão;
-        # o loop garante reconexão sem empilhar chamadas recursivas
 
 
 # ============================================================
@@ -705,11 +779,31 @@ def iniciar_bot():
 
 if __name__ == "__main__":
 
-    thread = threading.Thread(target=iniciar_bot, daemon=True)
-    thread.start()
+    print(
+        "======================================"
+    )
 
-    porta = int(os.environ.get("PORT", 10000))
+    print(
+        "🤖 BOT DE FUTEBOL"
+    )
 
-    print(f"FLASK INICIADO NA PORTA {porta}")
+    print(
+        "📡 API-Sports/API-Football"
+    )
 
-    app.run(host="0.0.0.0", port=porta)
+    print(
+        "🚀 Iniciando..."
+    )
+
+    print(
+        "======================================"
+    )
+
+    servidor = threading.Thread(
+        target=iniciar_servidor,
+        daemon=True
+    )
+
+    servidor.start()
+
+    iniciar_bot()
