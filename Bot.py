@@ -1,15 +1,14 @@
 import os
 import time
 import threading
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
 import requests
 import telebot
-
+from telebot.apihelper import ApiTelegramException
 from flask import Flask
 
-
-# ============================================================
-# CONFIGURAÇÕES
-# ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
@@ -22,8 +21,10 @@ API_FOOTBALL_KEY = (
 API_BASE = "https://v3.football.api-sports.io"
 
 HEADERS = {
-    "x-apisports-key": API_FOOTBALL_KEY
+    "x-apisports-key": API_FOOTBALL_KEY or ""
 }
+
+TZ = ZoneInfo("America/Sao_Paulo")
 
 app = Flask(__name__)
 
@@ -33,7 +34,7 @@ BOT_ATIVO = True
 
 
 # ============================================================
-# LIGAS
+# PRINCIPAIS COMPETIÇÕES
 # ============================================================
 
 LIGAS = {
@@ -50,31 +51,38 @@ LIGAS = {
     11: "Copa Sul-Americana"
 }
 
+LIGA_IDS = "-".join(map(str, LIGAS))
+
 
 # ============================================================
-# CONTROLE SIMPLES DE REQUISIÇÕES
+# CONTROLE DE REQUISIÇÕES (10/min no plano grátis da API-Football)
+#
+# Diferente da versão anterior, isso ESPERA em vez de simplesmente
+# recusar a chamada — assim uma resposta vazia da API significa
+# "a API não tinha dado", nunca "nós nos autolimitamos" (as duas
+# coisas estavam se confundindo nas mensagens antes).
 # ============================================================
 
 historico_chamadas = []
+LIMITE_POR_MINUTO = 9  # margem de segurança abaixo do limite real (10)
 
 
-def pode_fazer_requisicao():
+def aguardar_limite():
+
     agora = time.time()
 
-    # Remove chamadas com mais de 60 segundos
-    while historico_chamadas:
-        if agora - historico_chamadas[0] > 60:
-            historico_chamadas.pop(0)
-        else:
-            break
+    while historico_chamadas and agora - historico_chamadas[0] > 60:
+        historico_chamadas.pop(0)
 
-    # Mantém o limite abaixo de 10/minuto
-    if len(historico_chamadas) >= 9:
-        return False
+    if len(historico_chamadas) >= LIMITE_POR_MINUTO:
 
-    historico_chamadas.append(agora)
+        espera = 60 - (agora - historico_chamadas[0]) + 0.2
 
-    return True
+        if espera > 0:
+            print(f"Aguardando {espera:.1f}s para respeitar limite de requisições/min...")
+            time.sleep(espera)
+
+    historico_chamadas.append(time.time())
 
 
 # ============================================================
@@ -84,135 +92,110 @@ def pode_fazer_requisicao():
 def api_get(endpoint, params=None):
 
     if not API_FOOTBALL_KEY:
-        print("❌ API_FOOTBALL_KEY não configurada.")
+        print("ERRO: API_FOOTBALL_KEY não configurada.")
         return None
 
-    if not pode_fazer_requisicao():
-        print("⏳ Limite temporário de chamadas atingido.")
-        return None
+    aguardar_limite()
 
     try:
 
-        url = API_BASE + endpoint
-
         resposta = requests.get(
-            url,
+            API_BASE + endpoint,
             headers=HEADERS,
-            params=params,
+            params=params or {},
             timeout=20
         )
 
-        print(
-            f"API {endpoint} | "
-            f"HTTP {resposta.status_code}"
-        )
+        print(f"API {endpoint} | HTTP {resposta.status_code}")
 
         if resposta.status_code == 429:
-            print("⏳ API retornou 429.")
+            print("LIMITE DIÁRIO/MINUTO DA API-FOOTBALL ATINGIDO.")
             return None
 
         if resposta.status_code != 200:
-            print(
-                f"❌ Erro HTTP {resposta.status_code}: "
-                f"{resposta.text[:500]}"
-            )
+            print(resposta.text[:500])
             return None
 
         dados = resposta.json()
 
         if dados.get("errors"):
-            print(
-                f"⚠️ Erros da API: "
-                f"{dados.get('errors')}"
-            )
+            print("API errors:", dados["errors"])
 
         return dados
 
     except Exception as e:
-
-        print(
-            f"❌ Erro na comunicação com API: {e}"
-        )
-
+        print("API error:", e)
         return None
 
 
 # ============================================================
 # STATUS DA API
+#
+# Corrigido: a versão anterior lia campos ("account.status",
+# "requests.current"/"limit_day") que não existem na resposta real
+# da API-Football, então /status sempre reportava "offline" mesmo
+# funcionando. Agora o online/offline vem do HTTP 200 em si (que é
+# garantido pela doc), e a cota vem dos HEADERS de rate limit
+# (x-ratelimit-requests-limit/remaining), que são documentados e
+# estáveis — em vez de adivinhar nomes de campo no corpo da resposta.
 # ============================================================
 
 def verificar_api():
 
+    if not API_FOOTBALL_KEY:
+        return False, "API_FOOTBALL_KEY não configurada."
+
     try:
-
-        dados = api_get("/status")
-
-        if not dados:
-            return False, "Sem resposta da API."
-
-        if dados.get("errors"):
-            return False, str(dados["errors"])
-
-        response = dados.get("response", {})
-
-        account = response.get("account", {})
-        subscription = response.get("subscription", {})
-        requests_data = response.get("requests", {})
-
-        status = account.get("status", "unknown")
-        plano = subscription.get("plan", "unknown")
-
-        usados = requests_data.get("current", 0)
-        limite = requests_data.get("limit_day", 0)
-
-        mensagem = (
-            f"Conta: {status}\n"
-            f"Plano: {plano}\n"
-            f"Requisições hoje: {usados}/{limite}"
+        resposta = requests.get(
+            API_BASE + "/status",
+            headers=HEADERS,
+            timeout=15
         )
-
-        if status != "active":
-            return False, mensagem
-
-        return True, mensagem
-
     except Exception as e:
+        return False, f"Sem resposta da API ({e})."
 
-        return False, str(e)
+    if resposta.status_code != 200:
+        return False, f"HTTP {resposta.status_code}: {resposta.text[:200]}"
+
+    limite_dia = resposta.headers.get("x-ratelimit-requests-limit", "?")
+    restante_dia = resposta.headers.get("x-ratelimit-requests-remaining", "?")
+
+    dados = resposta.json().get("response", {}) or {}
+    account = dados.get("account", {}) or {}
+    subscription = dados.get("subscription", {}) or {}
+
+    email = account.get("email", "—")
+    plano = subscription.get("plan", "—")
+
+    mensagem = (
+        f"Conta: {email}\n"
+        f"Plano: {plano}\n"
+        f"Requisições hoje: {restante_dia} restantes de {limite_dia}"
+    )
+
+    return True, mensagem
 
 
 # ============================================================
-# JOGOS DO DIA
+# JOGOS DO DIA (1 requisição em vez de 1 por liga)
 # ============================================================
 
 def jogos_do_dia(data):
 
+    dados = api_get("/fixtures", {"date": data, "timezone": "America/Sao_Paulo"})
+
+    if not dados:
+        return []
+
     resultados = []
 
-    for liga_id, nome_liga in LIGAS.items():
+    for jogo in dados.get("response", []):
 
-        dados = api_get(
-            "/fixtures",
-            {
-                "date": data,
-                "league": liga_id,
-                "timezone": "America/Sao_Paulo"
-            }
-        )
+        liga_id = jogo.get("league", {}).get("id")
 
-        if not dados:
-            continue
-
-        jogos = dados.get("response", [])
-
-        for jogo in jogos:
-
-            jogo["_nome_liga_bot"] = nome_liga
-
+        if liga_id in LIGAS:
+            jogo["_nome_liga_bot"] = LIGAS[liga_id]
             resultados.append(jogo)
-
-            # Pequeno intervalo para evitar várias chamadas seguidas
-            time.sleep(0.5)
 
     return resultados
 
@@ -220,200 +203,85 @@ def jogos_do_dia(data):
 # ============================================================
 # ÚLTIMOS 10 JOGOS
 # ============================================================
-#
-# CORREÇÃO PRINCIPAL:
-#
-# Antes:
-# team + league + season + last=10
-#
-# Agora:
-# team + last=10
-#
-# Assim buscamos os 10 jogos mais recentes da equipe,
-# independentemente da competição.
-# ============================================================
 
 def ultimos_10(team_id):
 
-    try:
-
-        dados = api_get(
-            "/fixtures",
-            {
-                "team": team_id,
-                "last": 10
-            }
-        )
-
-        if not dados:
-
-            print(
-                f"⚠️ Sem resposta ao buscar "
-                f"últimos jogos do time {team_id}"
-            )
-
-            return []
-
-        if dados.get("errors"):
-
-            print(
-                f"⚠️ Erro histórico do time "
-                f"{team_id}: {dados['errors']}"
-            )
-
-            return []
-
-        jogos = dados.get("response", [])
-
-        if not isinstance(jogos, list):
-
-            return []
-
-        finalizados = []
-
-        for jogo in jogos:
-
-            fixture = jogo.get("fixture", {})
-            status = fixture.get("status", {})
-
-            codigo = status.get("short")
-
-            # Partidas realmente encerradas
-            if codigo in ["FT", "AET", "PEN"]:
-
-                finalizados.append(jogo)
-
-        print(
-            f"📊 Time {team_id}: "
-            f"{len(finalizados)} jogos encontrados"
-        )
-
-        return finalizados[:10]
-
-    except Exception as e:
-
-        print(
-            f"❌ Erro ao buscar histórico "
-            f"do time {team_id}: {e}"
-        )
-
+    if not team_id:
         return []
+
+    dados = api_get("/fixtures", {"team": team_id, "last": 10})
+
+    if not dados:
+        return []
+
+    jogos = dados.get("response", [])
+
+    finalizados = [
+        j for j in jogos
+        if j.get("fixture", {}).get("status", {}).get("short") in ("FT", "AET", "PEN")
+    ]
+
+    return finalizados[:10]
 
 
 # ============================================================
-# RESUMO DAS ÚLTIMAS 10 PARTIDAS
+# RESUMO
 # ============================================================
 
 def resumo(jogos, team_id):
 
     if not jogos:
+        return {"disponivel": False}
 
-        return {
-            "disponivel": False,
-            "jogos": 0,
-            "vitorias": 0,
-            "empates": 0,
-            "derrotas": 0,
-            "gols_marcados": 0,
-            "gols_sofridos": 0,
-            "over15": 0,
-            "over25": 0,
-            "ambas": 0
-        }
-
-    vitorias = 0
-    empates = 0
-    derrotas = 0
-
-    gols_marcados = 0
-    gols_sofridos = 0
-
-    over15 = 0
-    over25 = 0
-    ambas = 0
-
+    vitorias = empates = derrotas = 0
+    gols_marcados = gols_sofridos = 0
+    over15 = over25 = ambas = 0
     total = 0
 
     for jogo in jogos:
 
-        teams = jogo.get("teams", {})
+        home = jogo.get("teams", {}).get("home", {})
+        away = jogo.get("teams", {}).get("away", {})
         gols = jogo.get("goals", {})
-
-        home = teams.get("home", {})
-        away = teams.get("away", {})
-
-        home_id = home.get("id")
-        away_id = away.get("id")
-
-        gh = gols.get("home")
-        ga = gols.get("away")
+        gh, ga = gols.get("home"), gols.get("away")
 
         if gh is None or ga is None:
             continue
 
-        if home_id == team_id:
-
-            marcados = gh
-            sofridos = ga
-
-        elif away_id == team_id:
-
-            marcados = ga
-            sofridos = gh
-
+        if home.get("id") == team_id:
+            marcados, sofridos = gh, ga
+        elif away.get("id") == team_id:
+            marcados, sofridos = ga, gh
         else:
-
             continue
 
         total += 1
-
         gols_marcados += marcados
         gols_sofridos += sofridos
 
-        # Resultado
         if marcados > sofridos:
-
             vitorias += 1
-
         elif marcados == sofridos:
-
             empates += 1
-
         else:
-
             derrotas += 1
 
-        # Total de gols
         total_gols = marcados + sofridos
 
         if total_gols >= 2:
-
             over15 += 1
-
         if total_gols >= 3:
-
             over25 += 1
-
         if marcados > 0 and sofridos > 0:
-
             ambas += 1
 
-    # Se nenhuma partida pôde ser processada,
-    # NÃO fingimos que foram 0V 0E 0D.
     if total == 0:
+        return {"disponivel": False}
 
-        return {
-            "disponivel": False,
-            "jogos": 0,
-            "vitorias": 0,
-            "empates": 0,
-            "derrotas": 0,
-            "gols_marcados": 0,
-            "gols_sofridos": 0,
-            "over15": 0,
-            "over25": 0,
-            "ambas": 0
-        }
+    # aproveitamento em % dos pontos possíveis (3 por vitória) —
+    # fica na mesma escala 0-100 que over15/over25/ambas, então dá
+    # pra comparar "força" de mercados diferentes sem distorcer.
+    aproveitamento = round((vitorias * 3 + empates) / (total * 3) * 100)
 
     return {
         "disponivel": True,
@@ -423,42 +291,27 @@ def resumo(jogos, team_id):
         "derrotas": derrotas,
         "gols_marcados": gols_marcados,
         "gols_sofridos": gols_sofridos,
-        "over15": round((over15 / total) * 100),
-        "over25": round((over25 / total) * 100),
-        "ambas": round((ambas / total) * 100)
+        "aproveitamento": aproveitamento,
+        "over15": round(over15 / total * 100),
+        "over25": round(over25 / total * 100),
+        "ambas": round(ambas / total * 100)
     }
 
 
-# ============================================================
-# FORMATAÇÃO DO RESUMO
-# ============================================================
-
 def texto_resumo(nome, dados, emoji):
 
-    texto = f"{emoji} **{nome}**\n"
+    if not dados.get("disponivel"):
+        return f"{emoji} **{nome}**\n⚠️ Histórico recente indisponível.\n"
 
-    if not dados["disponivel"]:
-
-        texto += (
-            "⚠️ Histórico recente indisponível.\n"
-        )
-
-        return texto
-
-    texto += (
+    return (
+        f"{emoji} **{nome}**\n"
         f"📊 Jogos analisados: {dados['jogos']}\n"
-        f"🏆 {dados['vitorias']}V "
-        f"{dados['empates']}E "
-        f"{dados['derrotas']}D\n"
-        f"⚽ Gols: {dados['gols_marcados']} "
-        f"marcados / "
-        f"{dados['gols_sofridos']} sofridos\n"
-        f"📈 Over 1,5: {dados['over15']}%\n"
-        f"📈 Over 2,5: {dados['over25']}%\n"
-        f"🎯 Ambas marcam: {dados['ambas']}%\n"
+        f"🏆 {dados['vitorias']}V {dados['empates']}E {dados['derrotas']}D "
+        f"(aproveitamento {dados['aproveitamento']}%)\n"
+        f"⚽ Gols: {dados['gols_marcados']} marcados / {dados['gols_sofridos']} sofridos\n"
+        f"📈 Over 1,5: {dados['over15']}% | Over 2,5: {dados['over25']}% | "
+        f"Ambas marcam: {dados['ambas']}%\n"
     )
-
-    return texto
 
 
 # ============================================================
@@ -467,270 +320,108 @@ def texto_resumo(nome, dados, emoji):
 
 def analisar_jogo(jogo):
 
-    teams = jogo.get("teams", {})
+    home = jogo.get("teams", {}).get("home", {})
+    away = jogo.get("teams", {}).get("away", {})
+    home_id, away_id = home.get("id"), away.get("id")
 
-    home = teams.get("home", {})
-    away = teams.get("away", {})
-
-    home_id = home.get("id")
-    away_id = away.get("id")
-
-    home_name = home.get("name", "Mandante")
-    away_name = away.get("name", "Visitante")
-
-    home_jogos = ultimos_10(home_id)
-
-    # Pequena pausa para não disparar as duas consultas
-    time.sleep(1)
-
-    away_jogos = ultimos_10(away_id)
-
-    home_resumo = resumo(
-        home_jogos,
-        home_id
-    )
-
-    away_resumo = resumo(
-        away_jogos,
-        away_id
-    )
+    home_resumo = resumo(ultimos_10(home_id), home_id)
+    away_resumo = resumo(ultimos_10(away_id), away_id)
 
     oportunidades = []
 
-    # ========================================================
-    # OPORTUNIDADE 1 - RESULTADO / DUPLA POSSIBILIDADE
-    # ========================================================
+    if home_resumo.get("disponivel") and away_resumo.get("disponivel"):
 
-    if (
-        home_resumo["disponivel"]
-        and away_resumo["disponivel"]
-    ):
+        diferenca = home_resumo["aproveitamento"] - away_resumo["aproveitamento"]
 
-        home_forca = (
-            home_resumo["vitorias"] * 3
-            + home_resumo["empates"]
-        )
-
-        away_forca = (
-            away_resumo["vitorias"] * 3
-            + away_resumo["empates"]
-        )
-
-        if home_forca >= away_forca:
-
+        if abs(diferenca) >= 8:
+            favorito = home.get("name") if diferenca > 0 else away.get("name")
             oportunidades.append({
-                "titulo": f"{home_name} ou empate (1X)",
+                "titulo": f"{favorito} ou empate (dupla chance)",
                 "mercado": "Dupla possibilidade",
-                "forca": home_forca - away_forca,
-                "motivo": (
-                    "melhor desempenho recente "
-                    "do mandante"
-                )
+                "forca": min(50 + abs(diferenca), 95),
+                "motivo": f"aproveitamento {abs(diferenca)} pontos percentuais melhor nos últimos jogos"
             })
 
-        else:
+        over25 = (home_resumo["over25"] + away_resumo["over25"]) / 2
+        over15 = (home_resumo["over15"] + away_resumo["over15"]) / 2
+        ambas = (home_resumo["ambas"] + away_resumo["ambas"]) / 2
 
-            oportunidades.append({
-                "titulo": f"Empate ou {away_name} (X2)",
-                "mercado": "Dupla possibilidade",
-                "forca": away_forca - home_forca,
-                "motivo": (
-                    "melhor desempenho recente "
-                    "do visitante"
-                )
-            })
-
-    # ========================================================
-    # OPORTUNIDADE 2 - GOLS
-    # ========================================================
-
-    if (
-        home_resumo["disponivel"]
-        and away_resumo["disponivel"]
-    ):
-
-        over25_media = (
-            home_resumo["over25"]
-            + away_resumo["over25"]
-        ) / 2
-
-        over15_media = (
-            home_resumo["over15"]
-            + away_resumo["over15"]
-        ) / 2
-
-        ambas_media = (
-            home_resumo["ambas"]
-            + away_resumo["ambas"]
-        ) / 2
-
-        if over25_media >= 60:
-
+        if over25 >= 60:
             oportunidades.append({
                 "titulo": "Mais de 2,5 gols",
                 "mercado": "Mais/Menos gols",
-                "forca": over25_media,
-                "motivo": (
-                    f"Over 2,5 em média de "
-                    f"{round(over25_media)}% "
-                    f"dos últimos jogos"
-                )
+                "forca": over25,
+                "motivo": f"Over 2,5 em média de {round(over25)}% dos últimos jogos dos dois times"
             })
-
-        elif over15_media >= 75:
-
+        elif over15 >= 75:
             oportunidades.append({
                 "titulo": "Mais de 1,5 gols",
                 "mercado": "Mais/Menos gols",
-                "forca": over15_media,
-                "motivo": (
-                    f"Over 1,5 em média de "
-                    f"{round(over15_media)}% "
-                    f"dos últimos jogos"
-                )
+                "forca": over15,
+                "motivo": f"Over 1,5 em média de {round(over15)}% dos últimos jogos dos dois times"
             })
-
-        elif ambas_media >= 60:
-
+        elif ambas >= 60:
             oportunidades.append({
                 "titulo": "Ambas marcam",
                 "mercado": "Ambas Marcam",
-                "forca": ambas_media,
-                "motivo": (
-                    f"Ambas marcam em média de "
-                    f"{round(ambas_media)}% "
-                    f"dos últimos jogos"
-                )
+                "forca": ambas,
+                "motivo": f"ambas marcam em média de {round(ambas)}% dos últimos jogos"
             })
 
-    # ========================================================
-    # SE NÃO HOUVER HISTÓRICO
-    # ========================================================
-
     if not oportunidades:
-
         oportunidades.append({
             "titulo": "Aguardar mais dados",
             "mercado": "Sem entrada estatística",
             "forca": 0,
-            "motivo": (
-                "Não há histórico suficiente "
-                "para gerar uma oportunidade."
-            )
+            "motivo": "não há sinal estatístico forte o bastante nos últimos jogos"
         })
 
-    # Ordena pelas melhores indicações
-    oportunidades.sort(
-        key=lambda x: x["forca"],
-        reverse=True
-    )
+    oportunidades.sort(key=lambda x: x["forca"], reverse=True)
 
-    return (
-        home_resumo,
-        away_resumo,
-        oportunidades[:2]
-    )
+    return home_resumo, away_resumo, oportunidades[:2]
 
-
-# ============================================================
-# FORMATA JOGO
-# ============================================================
 
 def formatar_jogo(jogo):
 
     fixture = jogo.get("fixture", {})
-
-    teams = jogo.get("teams", {})
-
-    home = teams.get("home", {})
-    away = teams.get("away", {})
-
-    home_name = home.get("name", "Mandante")
-    away_name = away.get("name", "Visitante")
+    home = jogo.get("teams", {}).get("home", {})
+    away = jogo.get("teams", {}).get("away", {})
 
     data_hora = fixture.get("date", "")
 
     if "T" in data_hora:
-
-        data = data_hora.split("T")[0]
-        hora = data_hora.split("T")[1][:5]
-
-        partes = data.split("-")
-
-        if len(partes) == 3:
-
-            data_formatada = (
-                f"{partes[2]}/"
-                f"{partes[1]}/"
-                f"{partes[0]}"
-            )
-
-        else:
-
-            data_formatada = data
-
+        data, hora = data_hora.split("T")[0], data_hora.split("T")[1][:5]
+        p = data.split("-")
+        data = f"{p[2]}/{p[1]}/{p[0]}"
     else:
+        data, hora = data_hora, ""
 
-        data_formatada = data_hora
-        hora = ""
+    home_resumo, away_resumo, oportunidades = analisar_jogo(jogo)
 
-    liga = jogo.get(
-        "_nome_liga_bot",
-        jogo.get("league", {}).get(
-            "name",
-            "Competição"
-        )
-    )
-
-    (
-        home_resumo,
-        away_resumo,
-        oportunidades
-    ) = analisar_jogo(jogo)
+    liga = jogo.get("_nome_liga_bot") or jogo.get("league", {}).get("name", "Competição")
 
     texto = (
-        f"⚽ **{home_name} x {away_name}**\n"
+        f"⚽ **{home.get('name')} x {away.get('name')}**\n"
         f"🏆 {liga}\n"
-        f"🕐 {data_formatada} {hora}\n\n"
+        f"🆔 ID: `{fixture.get('id')}`\n"
+        f"🕐 {data} {hora}\n\n"
+        "📊 **ÚLTIMAS 10 PARTIDAS**\n\n"
     )
 
-    texto += "📊 **ÚLTIMAS 10 PARTIDAS**\n\n"
-
-    texto += texto_resumo(
-        home_name,
-        home_resumo,
-        "🏠"
-    )
-
+    texto += texto_resumo(home.get("name"), home_resumo, "🏠")
     texto += "\n"
+    texto += texto_resumo(away.get("name"), away_resumo, "✈️")
+    texto += "\n🎯 **MELHOR OPORTUNIDADE**\n\n"
 
-    texto += texto_resumo(
-        away_name,
-        away_resumo,
-        "✈️"
-    )
-
-    texto += "\n🎯 **2 MELHORES OPORTUNIDADES**\n\n"
-
-    for i, oportunidade in enumerate(
-        oportunidades,
-        start=1
-    ):
-
+    for i, op in enumerate(oportunidades, 1):
         texto += (
-            f"**{i}. "
-            f"{oportunidade['titulo']}**\n"
-            f"📌 Mercado: "
-            f"{oportunidade['mercado']}\n"
-            f"📊 Indicador estatístico: "
-            f"**{round(oportunidade['forca'])}**\n"
-            f"• {oportunidade['motivo']}\n\n"
+            f"**{i}. {op['titulo']}**\n"
+            f"📌 Mercado: {op['mercado']}\n"
+            f"📊 Confiança: **{round(op['forca'])}/100**\n"
+            f"• {op['motivo']}\n\n"
         )
 
-    texto += (
-        "⚠️ Análise estatística informativa. "
-        "Não garante resultado."
-    )
+    texto += "⚠️ Análise estatística informativa. Não garante resultado."
 
     return texto
 
@@ -741,287 +432,157 @@ def formatar_jogo(jogo):
 
 def jogos_live():
 
-    dados = api_get(
-        "/fixtures",
-        {
-            "live": "all",
-            "timezone": "America/Sao_Paulo"
-        }
-    )
+    dados = api_get("/fixtures", {"live": LIGA_IDS, "timezone": "America/Sao_Paulo"})
 
     if not dados:
-
         return []
 
-    if dados.get("errors"):
+    jogos = []
 
-        print(
-            f"⚠️ Erro nos jogos ao vivo: "
-            f"{dados['errors']}"
-        )
+    for jogo in dados.get("response", []):
+        liga_id = jogo.get("league", {}).get("id")
+        if liga_id in LIGAS:
+            jogo["_nome_liga_bot"] = LIGAS[liga_id]
+            jogos.append(jogo)
 
-        return []
+    return jogos
 
-    return dados.get("response", [])
-
-
-# ============================================================
-# ESTATÍSTICAS AO VIVO
-# ============================================================
 
 def estatisticas_live(fixture_id):
 
-    dados = api_get(
-        "/fixtures/statistics",
-        {
-            "fixture": fixture_id
-        }
-    )
+    dados = api_get("/fixtures/statistics", {"fixture": fixture_id})
 
     if not dados:
-
-        return []
-
-    if dados.get("errors"):
-
-        print(
-            f"⚠️ Erro nas estatísticas live: "
-            f"{dados['errors']}"
-        )
-
-        return []
+        return None
 
     return dados.get("response", [])
 
 
-# ============================================================
-# EXTRAI ESTATÍSTICA
-# ============================================================
+def stat(lista, nome):
 
-def pegar_statisticas_time(lista, nome):
+    for item in lista or []:
 
-    for item in lista:
+        if item.get("type") != nome:
+            continue
 
-        if item.get("type") == nome:
+        valor = item.get("value")
 
-            valor = item.get("value")
+        if valor is None:
+            return None
 
-            if valor is None:
-                return 0
+        try:
+            return float(str(valor).replace("%", "").replace(",", "."))
+        except (ValueError, TypeError):
+            return None
 
-            if isinstance(valor, str):
-
-                valor = (
-                    valor
-                    .replace("%", "")
-                    .replace(",", ".")
-                )
-
-            try:
-                return float(valor)
-
-            except:
-                return 0
-
-    return 0
+    return None
 
 
-# ============================================================
-# ANÁLISE LIVE
-# ============================================================
+def fmt(valor):
+
+    if valor is None:
+        return "—"
+
+    if float(valor).is_integer():
+        return str(int(valor))
+
+    return f"{valor:.1f}"
+
 
 def analisar_live(jogo):
 
     fixture = jogo.get("fixture", {})
+    home = jogo.get("teams", {}).get("home", {})
+    away = jogo.get("teams", {}).get("away", {})
 
-    teams = jogo.get("teams", {})
+    gols_home = jogo.get("goals", {}).get("home", 0) or 0
+    gols_away = jogo.get("goals", {}).get("away", 0) or 0
+    minuto = fixture.get("status", {}).get("elapsed", "?")
 
-    home = teams.get("home", {})
-    away = teams.get("away", {})
+    stats = estatisticas_live(fixture.get("id"))
 
-    home_name = home.get("name", "Mandante")
-    away_name = away.get("name", "Visitante")
+    if stats is None:
+        return (
+            "🔴 **JOGO AO VIVO**\n\n"
+            f"⚽ **{home.get('name')} {gols_home} x {gols_away} {away.get('name')}**\n"
+            f"⏱️ Minuto: {minuto}'\n\n"
+            "📊 **ESTATÍSTICAS**\n"
+            "⚠️ Ainda não disponíveis na API para esta partida.\n"
+        )
 
-    home_id = home.get("id")
-    away_id = away.get("id")
-
-    fixture_id = fixture.get("id")
-
-    gols = jogo.get("goals", {})
-
-    gols_home = gols.get("home", 0) or 0
-    gols_away = gols.get("away", 0) or 0
-
-    elapsed = (
-        fixture
-        .get("status", {})
-        .get("elapsed", "?")
-    )
-
-    stats = estatisticas_live(
-        fixture_id
-    )
-
-    home_stats = []
-    away_stats = []
+    home_stats, away_stats = [], []
 
     for equipe in stats:
+        team_id = equipe.get("team", {}).get("id")
+        if team_id == home.get("id"):
+            home_stats = equipe.get("statistics", [])
+        elif team_id == away.get("id"):
+            away_stats = equipe.get("statistics", [])
 
-        team = equipe.get("team", {})
-
-        if team.get("id") == home_id:
-
-            home_stats = equipe.get(
-                "statistics",
-                []
-            )
-
-        elif team.get("id") == away_id:
-
-            away_stats = equipe.get(
-                "statistics",
-                []
-            )
-
-    home_posse = pegar_statisticas_time(
-        home_stats,
-        "Ball Possession"
-    )
-
-    away_posse = pegar_statisticas_time(
-        away_stats,
-        "Ball Possession"
-    )
-
-    home_shots = pegar_statisticas_time(
-        home_stats,
-        "Total Shots"
-    )
-
-    away_shots = pegar_statisticas_time(
-        away_stats,
-        "Total Shots"
-    )
-
-    home_on = pegar_statisticas_time(
-        home_stats,
-        "Shots on Goal"
-    )
-
-    away_on = pegar_statisticas_time(
-        away_stats,
-        "Shots on Goal"
-    )
-
-    home_corners = pegar_statisticas_time(
-        home_stats,
-        "Corner Kicks"
-    )
-
-    away_corners = pegar_statisticas_time(
-        away_stats,
-        "Corner Kicks"
-    )
-
-    home_dangerous = pegar_statisticas_time(
-        home_stats,
-        "Dangerous Attacks"
-    )
-
-    away_dangerous = pegar_statisticas_time(
-        away_stats,
-        "Dangerous Attacks"
-    )
-
-    # ========================================================
-    # PRESSÃO
-    # ========================================================
-
-    pressao_home = (
-        home_posse * 0.20
-        + home_shots * 1.0
-        + home_on * 1.5
-        + home_corners * 1.2
-        + home_dangerous * 0.20
-    )
-
-    pressao_away = (
-        away_posse * 0.20
-        + away_shots * 1.0
-        + away_on * 1.5
-        + away_corners * 1.2
-        + away_dangerous * 0.20
-    )
+    home_posse = stat(home_stats, "Ball Possession")
+    away_posse = stat(away_stats, "Ball Possession")
+    home_shots = stat(home_stats, "Total Shots")
+    away_shots = stat(away_stats, "Total Shots")
+    home_on = stat(home_stats, "Shots on Goal")
+    away_on = stat(away_stats, "Shots on Goal")
+    home_corners = stat(home_stats, "Corner Kicks")
+    away_corners = stat(away_stats, "Corner Kicks")
 
     texto = (
-        f"🔴 **JOGO AO VIVO**\n\n"
-        f"⚽ **{home_name} "
-        f"{gols_home} x "
-        f"{gols_away} "
-        f"{away_name}**\n"
-        f"⏱️ Minuto: {elapsed}'\n\n"
-        f"📊 **ESTATÍSTICAS**\n\n"
-        f"🏠 {home_name}\n"
-        f"• Posse: {home_posse:.0f}%\n"
-        f"• Chutes: {home_shots:.0f}\n"
-        f"• Chutes no gol: {home_on:.0f}\n"
-        f"• Escanteios: {home_corners:.0f}\n"
-        f"• Ataques perigosos: "
-        f"{home_dangerous:.0f}\n\n"
-        f"✈️ {away_name}\n"
-        f"• Posse: {away_posse:.0f}%\n"
-        f"• Chutes: {away_shots:.0f}\n"
-        f"• Chutes no gol: {away_on:.0f}\n"
-        f"• Escanteios: {away_corners:.0f}\n"
-        f"• Ataques perigosos: "
-        f"{away_dangerous:.0f}\n\n"
+        "🔴 **JOGO AO VIVO**\n\n"
+        f"⚽ **{home.get('name')} {gols_home} x {gols_away} {away.get('name')}**\n"
+        f"⏱️ Minuto: {minuto}'\n\n"
+        "📊 **ESTATÍSTICAS**\n\n"
+        f"🏠 {home.get('name')}\n"
+        f"• Posse: {fmt(home_posse)}%\n"
+        f"• Chutes: {fmt(home_shots)} (no gol: {fmt(home_on)})\n"
+        f"• Escanteios: {fmt(home_corners)}\n\n"
+        f"✈️ {away.get('name')}\n"
+        f"• Posse: {fmt(away_posse)}%\n"
+        f"• Chutes: {fmt(away_shots)} (no gol: {fmt(away_on)})\n"
+        f"• Escanteios: {fmt(away_corners)}\n\n"
     )
 
-    if pressao_home > pressao_away * 1.20:
+    # --------------------------------------------------------
+    # PRESSÃO POR LADO E MELHOR ENTRADA
+    # (Nota: "Dangerous Attacks" não existe na API-Football —
+    # removido; era um campo de outro provedor que nunca respondia.)
+    # --------------------------------------------------------
 
-        texto += (
-            f"🔥 **Maior pressão: "
-            f"{home_name}**\n"
-        )
+    def pressao(posse, chutes, no_alvo, escanteios):
+        pontos = 0
+        if posse is not None:
+            pontos += 30 if posse >= 60 else (18 if posse >= 55 else 0)
+        if chutes is not None:
+            pontos += 25 if chutes >= 10 else (14 if chutes >= 6 else 0)
+        if no_alvo is not None:
+            pontos += 30 if no_alvo >= 4 else (16 if no_alvo >= 2 else 0)
+        if escanteios is not None:
+            pontos += 15 if escanteios >= 6 else (8 if escanteios >= 3 else 0)
+        return min(pontos, 100)
 
-    elif pressao_away > pressao_home * 1.20:
+    pressao_home = pressao(home_posse, home_shots, home_on, home_corners)
+    pressao_away = pressao(away_posse, away_shots, away_on, away_corners)
 
-        texto += (
-            f"🔥 **Maior pressão: "
-            f"{away_name}**\n"
-        )
+    diferenca = pressao_home - pressao_away
+    soma = pressao_home + pressao_away
+    gols_atuais = gols_home + gols_away
 
+    texto += f"🏠 Pressão {home.get('name')}: **{pressao_home}/100**\n"
+    texto += f"✈️ Pressão {away.get('name')}: **{pressao_away}/100**\n\n"
+
+    if abs(diferenca) >= 25 and max(pressao_home, pressao_away) >= 50:
+        favorito = home.get("name") if diferenca > 0 else away.get("name")
+        texto += f"🎯 **MELHOR ENTRADA: {favorito} (pressão dominante)**\n"
+    elif soma >= 120:
+        proxima_linha = gols_atuais + 0.5
+        texto += f"🎯 **MELHOR ENTRADA: Mais de {proxima_linha:g} gols (ambos pressionando)**\n"
+    elif soma >= 70:
+        texto += "🟠 Sinais de pressão dos dois lados — ainda sem entrada clara.\n"
     else:
+        texto += "⏳ **SEM ENTRADA CLARA no momento.**\n"
 
-        texto += (
-            "⚖️ **Pressão equilibrada**\n"
-        )
-
-    if (
-        home_corners + away_corners >= 7
-        and elapsed != "?"
-    ):
-
-        texto += (
-            "\n🎯 **Indicador:** "
-            "mercado de escanteios "
-            "pode estar interessante.\n"
-        )
-
-    if (
-        home_shots + away_shots >= 12
-        and elapsed != "?"
-    ):
-
-        texto += (
-            "\n⚽ **Indicador:** "
-            "volume ofensivo elevado.\n"
-        )
-
-    texto += (
-        "\n⚠️ Análise estatística informativa. "
-        "Não garante resultado."
-    )
+    texto += "\n⚠️ Análise estatística informativa. Não garante resultado."
 
     return texto
 
@@ -1035,399 +596,174 @@ def iniciar_bot():
     global bot
 
     if not BOT_TOKEN:
-
-        print(
-            "❌ BOT_TOKEN não configurado."
-        )
-
+        print("ERRO: BOT_TOKEN não configurado. O bot do Telegram não vai iniciar.")
         return
 
-    bot = telebot.TeleBot(
-        BOT_TOKEN,
-        parse_mode="Markdown"
-    )
+    bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
-    # --------------------------------------------------------
-    # START
-    # --------------------------------------------------------
-
-    @bot.message_handler(
-        commands=["start"]
-    )
+    @bot.message_handler(commands=["start"])
     def start(message):
-
         bot.send_message(
             message.chat.id,
             "🤖 **BOT DE ANÁLISE DE FUTEBOL**\n\n"
             "🟢 Bot conectado.\n\n"
-            "📡 Fonte de dados: "
-            "API-Sports / API-Football\n\n"
-            "Comandos disponíveis:\n\n"
-            "⚽ /jogos — Jogos do dia\n"
-            "🔴 /live — Jogos ao vivo\n"
-            "🔎 /analisar ID — Analisar um jogo\n"
-            "📡 /status — Ver conexão\n"
+            "📡 Fonte: API-Sports / API-Football\n\n"
+            "⚽ /jogos — Jogos do dia (com melhor oportunidade)\n"
+            "🔴 /live — Jogos ao vivo com melhor entrada\n"
+            "🔎 /analisar ID — Analisar um jogo específico\n"
+            "📡 /status — Ver conexão e cota da API\n"
             "⏸️ /pausar — Pausar bot\n"
             "▶️ /ativar — Ativar bot\n\n"
-            "A análise considera estatísticas, "
-            "forma recente e pressão do jogo.\n\n"
-            "ℹ️ As análises são informativas "
-            "e não garantem resultados."
+            "ℹ️ As análises são informativas e não garantem resultados."
         )
 
-    # --------------------------------------------------------
-    # STATUS
-    # --------------------------------------------------------
-
-    @bot.message_handler(
-        commands=["status"]
-    )
+    @bot.message_handler(commands=["status"])
     def status(message):
+        ok, info = verificar_api()
+        prefixo = "🟢 **API ONLINE**\n\n" if ok else "🔴 **API OFFLINE**\n\n"
+        bot.send_message(message.chat.id, prefixo + info)
 
-        ok, informacao = verificar_api()
-
-        if ok:
-
-            bot.send_message(
-                message.chat.id,
-                "🟢 **API ONLINE**\n\n"
-                f"{informacao}"
-            )
-
-        else:
-
-            bot.send_message(
-                message.chat.id,
-                "🔴 **API OFFLINE**\n\n"
-                f"{informacao}"
-            )
-
-    # --------------------------------------------------------
-    # PAUSAR
-    # --------------------------------------------------------
-
-    @bot.message_handler(
-        commands=["pausar"]
-    )
+    @bot.message_handler(commands=["pausar"])
     def pausar(message):
-
         global BOT_ATIVO
-
         BOT_ATIVO = False
+        bot.send_message(message.chat.id, "⏸️ Bot pausado.")
 
-        bot.send_message(
-            message.chat.id,
-            "⏸️ Bot pausado."
-        )
-
-    # --------------------------------------------------------
-    # ATIVAR
-    # --------------------------------------------------------
-
-    @bot.message_handler(
-        commands=["ativar"]
-    )
+    @bot.message_handler(commands=["ativar"])
     def ativar(message):
-
         global BOT_ATIVO
-
         BOT_ATIVO = True
+        bot.send_message(message.chat.id, "▶️ Bot ativado.")
 
-        bot.send_message(
-            message.chat.id,
-            "▶️ Bot ativado."
-        )
-
-    # --------------------------------------------------------
-    # JOGOS DO DIA
-    # --------------------------------------------------------
-
-    @bot.message_handler(
-        commands=["jogos"]
-    )
+    @bot.message_handler(commands=["jogos"])
     def jogos(message):
 
         if not BOT_ATIVO:
-
-            bot.send_message(
-                message.chat.id,
-                "⏸️ O bot está pausado."
-            )
-
+            bot.send_message(message.chat.id, "⏸️ Bot pausado.")
             return
 
-        bot.send_message(
-            message.chat.id,
-            "🔎 **Buscando os jogos do dia...**\n\n"
-            "Vou consultar os dados disponíveis."
-        )
+        bot.send_message(message.chat.id, "🔎 **Buscando jogos das principais ligas...**")
 
         try:
-
-            from datetime import datetime
-            from zoneinfo import ZoneInfo
-
-            agora = datetime.now(
-                ZoneInfo("America/Sao_Paulo")
-            )
-
-            data = agora.strftime(
-                "%Y-%m-%d"
-            )
-
+            data = datetime.now(TZ).strftime("%Y-%m-%d")
             lista = jogos_do_dia(data)
 
             if not lista:
-
                 bot.send_message(
                     message.chat.id,
-                    "⚠️ Nenhum jogo encontrado "
-                    "nas competições configuradas."
+                    "⚽ Nenhum jogo encontrado nas principais competições para hoje."
                 )
-
                 return
 
-            # Limite para não mandar uma mensagem
-            # gigantesca de uma vez
-            contador = 0
-
-            for jogo in lista:
-
-                texto = formatar_jogo(jogo)
-
-                bot.send_message(
-                    message.chat.id,
-                    texto
-                )
-
-                contador += 1
-
-                # Pequena pausa entre mensagens
+            for jogo in lista[:20]:
+                bot.send_message(message.chat.id, formatar_jogo(jogo))
                 time.sleep(1)
 
-                if contador >= 20:
-
-                    break
-
         except Exception as e:
+            print("Erro /jogos:", e)
+            bot.send_message(message.chat.id, "❌ Erro ao buscar os jogos.")
 
-            print(
-                f"❌ Erro /jogos: {e}"
-            )
-
-            bot.send_message(
-                message.chat.id,
-                "❌ Ocorreu um erro ao "
-                "buscar os jogos."
-            )
-
-    # --------------------------------------------------------
-    # LIVE
-    # --------------------------------------------------------
-
-    @bot.message_handler(
-        commands=["live"]
-    )
+    @bot.message_handler(commands=["live"])
     def live(message):
 
         if not BOT_ATIVO:
-
-            bot.send_message(
-                message.chat.id,
-                "⏸️ O bot está pausado."
-            )
-
+            bot.send_message(message.chat.id, "⏸️ Bot pausado.")
             return
 
-        bot.send_message(
-            message.chat.id,
-            "🔴 **Consultando jogos ao vivo...**"
-        )
+        bot.send_message(message.chat.id, "🔴 **Consultando jogos ao vivo...**")
 
         try:
-
             lista = jogos_live()
 
             if not lista:
-
                 bot.send_message(
                     message.chat.id,
-                    "⚽ Nenhum jogo ao vivo "
-                    "encontrado neste momento."
+                    "⚽ Nenhum jogo ao vivo nas principais ligas agora."
                 )
-
                 return
 
             for jogo in lista[:10]:
-
-                texto = analisar_live(
-                    jogo
-                )
-
-                bot.send_message(
-                    message.chat.id,
-                    texto
-                )
-
+                bot.send_message(message.chat.id, analisar_live(jogo))
                 time.sleep(1)
 
         except Exception as e:
+            print("Erro /live:", e)
+            bot.send_message(message.chat.id, "❌ Erro ao consultar jogos ao vivo.")
 
-            print(
-                f"❌ Erro /live: {e}"
-            )
-
-            bot.send_message(
-                message.chat.id,
-                "❌ Erro ao consultar "
-                "jogos ao vivo."
-            )
-
-    # --------------------------------------------------------
-    # ANALISAR ID
-    # --------------------------------------------------------
-
-    @bot.message_handler(
-        commands=["analisar"]
-    )
+    @bot.message_handler(commands=["analisar"])
     def analisar(message):
 
         partes = message.text.split()
 
         if len(partes) < 2:
-
-            bot.send_message(
-                message.chat.id,
-                "Use assim:\n\n"
-                "`/analisar ID`\n\n"
-                "Exemplo:\n"
-                "`/analisar 123456`"
-            )
-
+            bot.send_message(message.chat.id, "Use /analisar ID (o ID aparece em /jogos)")
             return
 
         try:
-
             fixture_id = int(partes[1])
-
-        except:
-
-            bot.send_message(
-                message.chat.id,
-                "❌ ID inválido."
-            )
-
+        except ValueError:
+            bot.send_message(message.chat.id, "❌ ID inválido.")
             return
 
-        bot.send_message(
-            message.chat.id,
-            "🔎 Buscando partida..."
-        )
+        dados = api_get("/fixtures", {"id": fixture_id, "timezone": "America/Sao_Paulo"})
 
-        try:
+        if not dados or not dados.get("response"):
+            bot.send_message(message.chat.id, "❌ Partida não encontrada.")
+            return
 
-            dados = api_get(
-                "/fixtures",
-                {
-                    "id": fixture_id,
-                    "timezone": "America/Sao_Paulo"
-                }
-            )
+        jogo = dados["response"][0]
+        league_id = jogo.get("league", {}).get("id")
 
-            if not dados:
-
-                bot.send_message(
-                    message.chat.id,
-                    "❌ Não foi possível "
-                    "consultar essa partida."
-                )
-
-                return
-
-            lista = dados.get(
-                "response",
-                []
-            )
-
-            if not lista:
-
-                bot.send_message(
-                    message.chat.id,
-                    "❌ Partida não encontrada."
-                )
-
-                return
-
-            jogo = lista[0]
-
-            texto = formatar_jogo(
-                jogo
-            )
-
+        if league_id not in LIGAS:
             bot.send_message(
                 message.chat.id,
-                texto
+                "⚠️ Esta partida não pertence às principais competições configuradas."
             )
+            return
 
-        except Exception as e:
-
-            print(
-                f"❌ Erro /analisar: {e}"
-            )
-
-            bot.send_message(
-                message.chat.id,
-                "❌ Erro ao analisar "
-                "a partida."
-            )
+        jogo["_nome_liga_bot"] = LIGAS[league_id]
+        bot.send_message(message.chat.id, formatar_jogo(jogo))
 
     # --------------------------------------------------------
-    # LOOP TELEGRAM
+    # Loop de polling. O 409 (Conflict) é esperado por alguns
+    # segundos durante um redeploy, enquanto a instância antiga
+    # ainda está desligando — tratado à parte, sem traceback
+    # completo, e com uma pausa maior antes de tentar de novo.
     # --------------------------------------------------------
 
     while True:
-
         try:
-
-            print(
-                "🤖 Iniciando Telegram..."
-            )
-
             bot.remove_webhook()
-
-            time.sleep(1)
-
-            bot.infinity_polling(
-                timeout=30,
-                long_polling_timeout=30
-            )
-
+            time.sleep(2)
+            bot.infinity_polling(timeout=30, long_polling_timeout=30, skip_pending=True)
+        except ApiTelegramException as e:
+            if getattr(e, "error_code", None) == 409:
+                print("Outra instância ainda está ativa (409) — aguardando ela desligar...")
+                time.sleep(15)
+            else:
+                print("Telegram (API):", e)
+                time.sleep(10)
         except Exception as e:
-
-            print(
-                f"❌ Erro Telegram: {e}"
-            )
-
+            print("Telegram:", e)
             time.sleep(10)
 
 
 # ============================================================
-# FLASK / RENDER
+# RENDER
 # ============================================================
 
 @app.route("/")
 def home():
-
     return "Bot funcionando!"
 
 
 @app.route("/health")
 def health():
-
     return {
         "status": "online",
         "bot": "telegram",
-        "api": "API-Sports / API-Football"
+        "api": "API-Sports / API-Football",
+        "ligas": list(LIGAS.values())
     }
 
 
@@ -1442,40 +778,15 @@ if __name__ == "__main__":
     print("📡 API-Sports / API-Football")
     print("=" * 50)
 
-    if not BOT_TOKEN:
-
-        print(
-            "❌ ERRO: BOT_TOKEN não encontrado."
-        )
-
-    elif not API_FOOTBALL_KEY:
-
-        print(
-            "❌ ERRO: API_FOOTBALL_KEY "
-            "não encontrada."
-        )
-
+    if BOT_TOKEN and API_FOOTBALL_KEY:
+        print("✅ Variáveis de ambiente encontradas.")
     else:
+        print("ERRO: variáveis ausentes (BOT_TOKEN / API_FOOTBALL_KEY).")
 
-        print(
-            "✅ Variáveis de ambiente encontradas."
-        )
+    print("🤖 Iniciando Telegram...")
 
-    thread = threading.Thread(
-        target=iniciar_bot,
-        daemon=True
-    )
+    threading.Thread(target=iniciar_bot, daemon=True).start()
 
-    thread.start()
+    port = int(os.environ.get("PORT", 10000))
 
-    port = int(
-        os.environ.get(
-            "PORT",
-            10000
-        )
-    )
-
-    app.run(
-        host="0.0.0.0",
-        port=port
-    )
+    app.run(host="0.0.0.0", port=port)
